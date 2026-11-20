@@ -7,7 +7,7 @@
 //!
 //! Lock order: a room's state lock is never held while taking the room map.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -135,6 +135,9 @@ impl RoomHandle {
 
 pub struct Relay {
     rooms: Mutex<HashMap<Uuid, Arc<RoomHandle>>>,
+    /// Room ids handed to a creator whose handshake has not finished. Such a
+    /// room may still come into existence, so it is not yet "closed".
+    pending: Mutex<HashSet<Uuid>>,
     /// One permit per open connection, taken before the WebSocket upgrade.
     permits: Arc<Semaphore>,
     limits: Limits,
@@ -144,6 +147,7 @@ impl Relay {
     pub fn new(limits: Limits) -> Arc<Self> {
         Arc::new(Relay {
             rooms: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashSet::new()),
             permits: Arc::new(Semaphore::new(limits.max_connections)),
             limits,
         })
@@ -169,8 +173,15 @@ impl Relay {
         }
     }
 
-    fn lookup(&self, id: &Uuid) -> Option<Arc<RoomHandle>> {
-        self.rooms.lock().unwrap().get(id).cloned()
+    /// The room, or the refusal to send: `Closed` only when the id is
+    /// neither a room nor about to become one. Pending is checked first and
+    /// a creator clears it only after inserting the room, so a room cannot
+    /// slip between the two checks.
+    fn lookup(&self, id: &Uuid) -> Result<Arc<RoomHandle>, FromRelay> {
+        if self.pending.lock().unwrap().contains(id) {
+            return Err(err("room is still being created"));
+        }
+        self.rooms.lock().unwrap().get(id).cloned().ok_or(FromRelay::Closed)
     }
 
     /// Close the room if `allowed` still holds, deciding and closing in one
@@ -372,6 +383,15 @@ async fn challenge(conn: &mut Conn, room: Uuid) -> Result<[u8; 32], FromRelay> {
     if sent { Ok(nonce) } else { Err(err("gone")) }
 }
 
+/// Clears a pending room id when the creating handshake ends, either way.
+struct Pending<'a>(&'a Relay, Uuid);
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.pending.lock().unwrap().remove(&self.1);
+    }
+}
+
 /// Authenticate and take a seat. Returns the seat with the reply to send.
 async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRelay), FromRelay> {
     let first = conn.recv().await.ok_or_else(|| err("bad hello"))?;
@@ -384,6 +404,8 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
             // The relay picks the room id, so an id that is not in the map
             // either never existed or is closed. No tombstones needed.
             let id = Uuid::new_v4();
+            relay.pending.lock().unwrap().insert(id);
+            let _pending = Pending(relay, id);
             let nonce = challenge(conn, id).await?;
             let Some(ToRelay::CreateFin {
                 verifier,
@@ -444,7 +466,7 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
 
         ToRelay::Attach { room: id, session_key: key } => {
             let key = session_key(&key)?;
-            let room = relay.lookup(&id).ok_or(FromRelay::Closed)?;
+            let room = relay.lookup(&id)?;
             let nonce = challenge(conn, id).await?;
             let Some(ToRelay::Auth { sig }) = conn.recv().await else {
                 return Err(err("expected auth"));
@@ -495,7 +517,7 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
             cursor,
         } => {
             let key = session_key(&key)?;
-            let room = relay.lookup(&id).ok_or(FromRelay::Closed)?;
+            let room = relay.lookup(&id)?;
             let nonce = challenge(conn, id).await?;
             let Some(ToRelay::Auth { sig }) = conn.recv().await else {
                 return Err(err("expected auth"));
@@ -540,7 +562,7 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
         }
 
         ToRelay::Close { room: id } => {
-            let room = relay.lookup(&id).ok_or(FromRelay::Closed)?;
+            let room = relay.lookup(&id)?;
             let nonce = challenge(conn, id).await?;
             let Some(ToRelay::Auth { sig }) = conn.recv().await else {
                 return Err(err("expected auth"));

@@ -593,3 +593,60 @@ async fn the_relay_answers_pings() {
     let answer = timeout(Duration::from_secs(5), creator.ws.next()).await;
     assert!(matches!(answer, Ok(Some(Ok(Message::Pong(_))))), "got {answer:?}");
 }
+
+#[tokio::test]
+async fn a_room_still_being_created_is_not_reported_closed() {
+    let (relay, url) = start(Limits::default()).await;
+    let session = SigningKey::from_bytes(&random());
+    let spub = session.verifying_key().to_bytes();
+    let mut creator = Client {
+        ws: Client::open(&url).await,
+        session,
+    };
+    creator
+        .send(ToRelay::Create {
+            session_key: b64(&spub),
+        })
+        .await;
+    let Some(FromRelay::Challenge { room, nonce }) = creator.recv().await else {
+        panic!("no challenge")
+    };
+    let keys = RoomKeys::derive(&room, &random());
+
+    // The id is issued but the room is not there yet: neither gone nor open.
+    let answer = close_with(&url, room, &keys.invite_key, "close").await;
+    assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
+    let (_, answer) = attach_with(&url, room, &keys.invite_key).await;
+    assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
+
+    let t = transcript("create", &room, &unb64(&nonce).unwrap(), &spub, 0);
+    creator
+        .send(ToRelay::CreateFin {
+            verifier: b64(&keys.verifier()),
+            sig: sign(&keys.invite_key, &t),
+            group_info: "gi-0".into(),
+        })
+        .await;
+    assert!(matches!(creator.recv().await, Some(FromRelay::Attached { .. })));
+    let answer = close_with(&url, room, &keys.invite_key, "close").await;
+    assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
+    assert_eq!(relay.room_count(), 0);
+
+    // A creation that is abandoned leaves an id that never became a room.
+    let mut quitter = Client {
+        ws: Client::open(&url).await,
+        session: SigningKey::from_bytes(&random()),
+    };
+    quitter
+        .send(ToRelay::Create {
+            session_key: b64(&spub),
+        })
+        .await;
+    let Some(FromRelay::Challenge { room, .. }) = quitter.recv().await else {
+        panic!("no challenge")
+    };
+    drop(quitter);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let answer = close_with(&url, room, &keys.invite_key, "close").await;
+    assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
+}

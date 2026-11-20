@@ -285,21 +285,21 @@ async fn resume(invite: &Invite, session: &SigningKey, cursor: u64) -> Result<(W
     }
 }
 
-/// Close the room using only the invitation: no seat, no cursor. Returns
-/// whether the relay knew the room (true) or had no such room (false).
-async fn close_room(invite: &Invite, keys: &RoomKeys) -> Result<bool, String> {
+/// Close the room using only the invitation: no seat, no cursor. Ok means
+/// the relay closed it or has no such room, now or still to come.
+async fn close_room(invite: &Invite, keys: &RoomKeys) -> Result<(), String> {
     let mut ws = ws_connect(&invite.relay).await?;
     ws_send(&mut ws, &ToRelay::Close { room: invite.room }).await?;
     let nonce = match ws_expect(&mut ws).await? {
         FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce)?,
-        FromRelay::Closed => return Ok(false),
+        FromRelay::Closed => return Ok(()),
         other => return Err(format!("relay refused close: {other:?}")),
     };
     let t = transcript("close", &invite.room, &nonce, &[], 0);
     let sig = sign(&keys.invite_key, &t);
     ws_send(&mut ws, &ToRelay::Auth { sig }).await?;
     match ws_expect(&mut ws).await? {
-        FromRelay::Closed => Ok(true),
+        FromRelay::Closed => Ok(()),
         other => Err(format!("relay refused close: {other:?}")),
     }
 }
@@ -440,8 +440,6 @@ fn closed_reply() -> Value {
 struct Link {
     ws: Option<Ws>,
     room: Option<(Arc<Invite>, Arc<RoomKeys>)>,
-    /// A request to create the room has been sent and not yet answered.
-    creating: bool,
 }
 
 impl Session {
@@ -867,16 +865,14 @@ impl Drop for Session {
 /// needs only the invitation. Each gets half the time, so a silent
 /// connection cannot starve the other route.
 async fn notify_panic(link: Link) -> bool {
-    /// Send the panic on one connection and wait for `closed`. Notes if
-    /// the relay says on the way that our room was created.
-    async fn over(mut ws: Ws, creating: &mut bool) -> bool {
+    /// Send the panic on one connection and wait for `closed`.
+    async fn over(mut ws: Ws) -> bool {
         if ws_send(&mut ws, &ToRelay::Panic).await.is_err() {
             return false;
         }
         loop {
             match ws_recv(&mut ws).await {
                 Ok(FromRelay::Closed) => return true,
-                Ok(FromRelay::Attached { .. }) => *creating = false,
                 Ok(_) => continue,
                 Err(_) => return false,
             }
@@ -885,19 +881,15 @@ async fn notify_panic(link: Link) -> bool {
     let Some((invite, keys)) = link.room else {
         return false; // never got as far as knowing a room
     };
-    let mut creating = link.creating;
     let half = PANIC_NOTIFY / 2;
     if let Some(ws) = link.ws {
-        if timeout(half, over(ws, &mut creating)).await == Ok(true) {
+        if timeout(half, over(ws)).await == Ok(true) {
             return true;
         }
     }
-    match timeout(half, close_room(&invite, &keys)).await {
-        // "No such room" is as good as closed, except while our own request
-        // to create it may still be on its way.
-        Ok(Ok(existed)) => existed || !creating,
-        _ => false,
-    }
+    // The relay refuses rather than answers while a room is still being
+    // created, so "no such room" here is as good as closed.
+    matches!(timeout(half, close_room(&invite, &keys)).await, Ok(Ok(())))
 }
 
 /// Create a room: the relay allocates the id, then we register the verifier
@@ -934,7 +926,6 @@ async fn create(
     // From here the relay may hold the room. If we are cancelled before
     // hearing back, a panic follows the request down this same connection.
     link.room = Some((invite.clone(), keys.clone()));
-    link.creating = true;
     let ws = link.ws.insert(ws);
     ws_send(
         ws,
@@ -949,7 +940,6 @@ async fn create(
         FromRelay::Attached { .. } => {}
         other => return Err(format!("relay refused create: {other:?}")),
     }
-    link.creating = false;
     let encoded = invite.encode();
     let mut session = Session::new(shared, invite, keys, me, relay_session, 0);
     session.phase = Phase::Active { mls };
