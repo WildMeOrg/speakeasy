@@ -240,6 +240,7 @@ fn recv(handle: &str, wait: f64) -> Result<u8, String> {
 
 /// Pick the session: the one named, or the only one running.
 fn resolve(named: Option<String>) -> Result<String, String> {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
     if let Some(h) = named {
         return Ok(h);
     }
@@ -250,10 +251,9 @@ fn resolve(named: Option<String>) -> Result<String, String> {
         if path.extension().is_some_and(|x| x == "sock") {
             match UnixStream::connect(&path) {
                 Ok(_) => live.push(path.file_stem().unwrap().to_string_lossy().into_owned()),
-                // Nothing is listening: left behind by a dead daemon.
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    let _ = std::fs::remove_file(&path);
-                }
+                // Nothing is listening (left behind by a dead daemon), or it
+                // went away while we were looking.
+                Err(e) if matches!(e.kind(), ConnectionRefused | NotFound) => {}
                 Err(e) => return Err(format!("{}: {e}", path.display())),
             }
         }

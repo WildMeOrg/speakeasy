@@ -440,7 +440,7 @@ mod scripted {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::runtime::Runtime;
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
     use uuid::Uuid;
@@ -538,13 +538,25 @@ mod scripted {
         Unknowable,
     }
 
+    fn json(m: &ToRelay) -> serde_json::Value {
+        serde_json::to_value(m).unwrap()
+    }
+
     /// Take one message from the creator, drop the connection without
-    /// echoing it, then answer the reconnect according to `fate`.
+    /// echoing it, then answer the reconnect according to `fate`. The next
+    /// thing the creator submits after that must be a new message.
     pub async fn lose_an_echo(l: TcpListener, fate: Fate) -> Sock {
         let (mut ws, room, group_info) = begin_create(&l).await;
         tx(&mut ws, attached(0, group_info.clone())).await;
-        let ToRelay::Submit { id, data, kind: Kind::App, .. } = rx(&mut ws).await else {
+        let first = rx(&mut ws).await;
+        let ToRelay::Submit { id, data, kind: Kind::App, .. } = &first else {
             panic!("expected a message")
+        };
+        let frame = |seq, kind, id: &str, data: &str| FromRelay::Frame {
+            seq,
+            kind,
+            id: id.to_string(),
+            data: data.to_string(),
         };
         drop(ws);
 
@@ -556,27 +568,19 @@ mod scripted {
         let ToRelay::Auth { .. } = rx(&mut ws).await else {
             panic!("expected auth")
         };
-        let echo = |id: String, data: String| FromRelay::Frame {
-            seq: 1,
-            kind: Kind::App,
-            id,
-            data,
-        };
-        match fate {
+        // Where the room stands afterwards: (head, latest commit).
+        let (head, commit) = match fate {
             Fate::Sequenced => {
                 tx(&mut ws, FromRelay::Resumed { head: 1 }).await;
-                tx(&mut ws, echo(id, data)).await;
+                tx(&mut ws, frame(1, Kind::App, id, data)).await;
+                (1, 0)
             }
             Fate::NotSequenced => {
                 tx(&mut ws, FromRelay::Resumed { head: 0 }).await;
-                let ToRelay::Submit { id: again, data: same, kind: Kind::App, .. } =
-                    rx(&mut ws).await
-                else {
-                    panic!("expected the message again")
-                };
-                // The same submission, byte for byte: not a second message.
-                assert_eq!((&again, &same), (&id, &data));
-                tx(&mut ws, echo(id, data)).await;
+                // The same submission, field for field: not a second message.
+                assert_eq!(json(&rx(&mut ws).await), json(&first));
+                tx(&mut ws, frame(1, Kind::App, id, data)).await;
+                (1, 0)
             }
             Fate::Unknowable => {
                 tx(&mut ws, FromRelay::Gap).await;
@@ -594,23 +598,38 @@ mod scripted {
                 else {
                     panic!("expected the rejoin commit")
                 };
-                let (seq, kind) = (2, Kind::Commit);
-                tx(&mut ws, FromRelay::Frame { seq, kind, id, data }).await;
+                tx(&mut ws, frame(2, Kind::Commit, &id, &data)).await;
+                (2, 2)
             }
-        }
-        // Whatever happened, the message is never submitted again.
-        let more = timeout(Duration::from_secs(2), rx(&mut ws)).await;
-        assert!(more.is_err(), "unexpected submission: {more:?}");
+        };
+        // The next submission is the test's second message, so the first
+        // was not submitted again in between.
+        let ToRelay::Submit { id: next, data, kind: Kind::App, after_commit, .. } =
+            rx(&mut ws).await
+        else {
+            panic!("expected the second message")
+        };
+        assert_ne!(&next, id);
+        assert_eq!(after_commit, commit);
+        tx(&mut ws, frame(head + 1, Kind::App, &next, &data)).await;
         ws
     }
 
-    /// Bring the room into being, but hold back the final `attached` for a
-    /// while. Returns what the creator sent once it arrived.
+    /// Bring the room into being but never say so. The creator, once it
+    /// panics, has to come back for the room on a new connection. Returns
+    /// what it sent there.
     pub async fn stall_create(l: TcpListener, tell: std::sync::mpsc::Sender<()>) -> ToRelay {
-        let (mut ws, _, group_info) = begin_create(&l).await;
+        let (_stalled, room, _) = begin_create(&l).await;
         tell.send(()).unwrap();
-        sleep(Duration::from_millis(700)).await;
-        tx(&mut ws, attached(0, group_info)).await;
+        let mut ws = accept(&l).await;
+        let ToRelay::Resume { cursor: 0, .. } = rx(&mut ws).await else {
+            panic!("expected resume from 0")
+        };
+        tx(&mut ws, challenge(room)).await;
+        let ToRelay::Auth { .. } = rx(&mut ws).await else {
+            panic!("expected auth")
+        };
+        tx(&mut ws, FromRelay::Resumed { head: 0 }).await;
         let next = rx(&mut ws).await;
         tx(&mut ws, FromRelay::Closed).await;
         next
@@ -620,13 +639,14 @@ mod scripted {
 use scripted::Fate;
 
 /// Create a room on a relay that loses the echo of the first message, send
-/// one message, and return what `send` reported.
+/// two messages, and return what the first `send` reported.
 fn send_with_lost_echo(fate: Fate) -> Output {
     let relay = scripted::relay(move |l| scripted::lose_an_echo(l, fate));
     let alice = Agent::new();
     let out = alice.run(&["create", "--relay", &relay.url, "--name", "alice"]);
     assert_eq!(out.code, 0, "{:?}", out.lines);
     let out = alice.run_with(&["send"], Some("hello"));
+    alice.send("again");
     let _open = relay.finish();
     out
 }

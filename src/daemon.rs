@@ -68,6 +68,8 @@ struct Inbox {
     dropped: u64,
     phase: &'static str,
     closed: Option<String>,
+    /// After a local panic: whether the relay confirmed the closure.
+    panic_confirmed: Option<bool>,
     invite: Option<String>,
     room: Option<String>,
     name: String,
@@ -96,10 +98,23 @@ impl Shared {
         self.tick.send_modify(|n| *n += 1);
     }
 
-    /// A local panic is published here by the socket task the moment it
-    /// arrives, ahead of anything queued for the session.
-    fn panicked(&self) -> bool {
-        self.inbox.lock().unwrap().closed.as_deref() == Some("panic")
+    /// Wait until `f` yields something.
+    async fn wait_for<T>(&self, f: impl Fn(&Inbox) -> Option<T>) -> T {
+        let mut tick = self.tick.subscribe();
+        loop {
+            if let Some(found) = f(&self.inbox.lock().unwrap()) {
+                return found;
+            }
+            let _ = tick.changed().await;
+        }
+    }
+
+    /// Closing is first come, first kept, and is how a local panic or leave
+    /// stops the session: `run` is waiting on exactly this.
+    fn close(&self, reason: &str) {
+        self.update(|i| {
+            i.closed.get_or_insert_with(|| reason.to_string());
+        });
     }
 
     fn event(&self, e: Value) {
@@ -165,10 +180,6 @@ enum Fail {
     Gap,
 }
 
-fn io(e: String) -> Fail {
-    Fail::Io(e)
-}
-
 struct Snapshot {
     last_commit: u64,
     group_info: String,
@@ -185,7 +196,7 @@ struct Attached {
 async fn attach(invite: &Invite, keys: &RoomKeys) -> Result<Attached, Fail> {
     let relay_session = SigningKey::from_bytes(&random());
     let session_pub = relay_session.verifying_key().to_bytes();
-    let mut ws = ws_connect(&invite.relay).await.map_err(io)?;
+    let mut ws = ws_connect(&invite.relay).await.map_err(Fail::Io)?;
     ws_send(
         &mut ws,
         &ToRelay::Attach {
@@ -194,9 +205,9 @@ async fn attach(invite: &Invite, keys: &RoomKeys) -> Result<Attached, Fail> {
         },
     )
     .await
-    .map_err(io)?;
-    let nonce = match ws_expect(&mut ws).await.map_err(io)? {
-        FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce).map_err(io)?,
+    .map_err(Fail::Io)?;
+    let nonce = match ws_expect(&mut ws).await.map_err(Fail::Io)? {
+        FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce).map_err(Fail::Io)?,
         FromRelay::Closed => return Err(Fail::Closed("closed".into())),
         other => return Err(Fail::Closed(format!("relay refused attach: {other:?}"))),
     };
@@ -208,8 +219,8 @@ async fn attach(invite: &Invite, keys: &RoomKeys) -> Result<Attached, Fail> {
         },
     )
     .await
-    .map_err(io)?;
-    match ws_expect(&mut ws).await.map_err(io)? {
+    .map_err(Fail::Io)?;
+    match ws_expect(&mut ws).await.map_err(Fail::Io)? {
         FromRelay::Attached {
             head,
             last_commit,
@@ -230,7 +241,7 @@ async fn attach(invite: &Invite, keys: &RoomKeys) -> Result<Attached, Fail> {
 
 async fn resume(invite: &Invite, session: &SigningKey, cursor: u64) -> Result<(Ws, u64), Fail> {
     let session_pub = session.verifying_key().to_bytes();
-    let mut ws = ws_connect(&invite.relay).await.map_err(io)?;
+    let mut ws = ws_connect(&invite.relay).await.map_err(Fail::Io)?;
     ws_send(
         &mut ws,
         &ToRelay::Resume {
@@ -240,9 +251,9 @@ async fn resume(invite: &Invite, session: &SigningKey, cursor: u64) -> Result<(W
         },
     )
     .await
-    .map_err(io)?;
-    let nonce = match ws_expect(&mut ws).await.map_err(io)? {
-        FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce).map_err(io)?,
+    .map_err(Fail::Io)?;
+    let nonce = match ws_expect(&mut ws).await.map_err(Fail::Io)? {
+        FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce).map_err(Fail::Io)?,
         // A restarted relay has no rooms, so an unknown room means closed.
         FromRelay::Closed => return Err(Fail::Closed("closed".into())),
         other => return Err(Fail::Closed(format!("relay refused resume: {other:?}"))),
@@ -250,8 +261,8 @@ async fn resume(invite: &Invite, session: &SigningKey, cursor: u64) -> Result<(W
     let t = transcript("resume", &invite.room, &nonce, &session_pub, cursor);
     ws_send(&mut ws, &ToRelay::Auth { sig: sign(session, &t) })
         .await
-        .map_err(io)?;
-    match ws_expect(&mut ws).await.map_err(io)? {
+        .map_err(Fail::Io)?;
+    match ws_expect(&mut ws).await.map_err(Fail::Io)? {
         FromRelay::Resumed { head } => Ok((ws, head)),
         FromRelay::Gap => Err(Fail::Gap),
         FromRelay::Closed => Err(Fail::Closed("closed".into())),
@@ -362,7 +373,7 @@ struct Session {
     /// Seq of the last commit processed: the relay's ordering token.
     last_commit: u64,
     /// Local sends in the order they were made.
-    outgoing: Vec<Outgoing>,
+    outgoing: VecDeque<Outgoing>,
     /// Messages for the current connection. Only filled while online.
     outbox: Vec<ToRelay>,
     online: bool,
@@ -370,54 +381,68 @@ struct Session {
     /// of our submissions were sequenced, so nothing is (re)submitted.
     replaying_to: Option<u64>,
     snapshot_at: Option<Instant>,
-    /// When we last heard from the relay or started waiting on it.
+    /// When the thing we are waiting on the relay for last made progress.
     quiet_since: Instant,
+    /// When the connection first went wrong, until it is working again.
+    troubled_since: Option<Instant>,
     /// A send we stopped waiting for while it was in flight. Its echo may
     /// still arrive and must not be mistaken for someone else's message.
     /// Abandoning forces a resume, whose replay settles it.
     abandoned: Option<String>,
     /// The relay told this connection it fell behind: rejoin.
     fell_behind: bool,
-    panic_reply: Option<oneshot::Sender<Value>>,
     closed: Option<String>,
 }
 
-/// A local command, its reply channel, and when it arrived.
-type Command = (Request, oneshot::Sender<Value>, Instant);
+/// A local `send`: its text, its reply channel, and when it arrived.
+type Command = (String, oneshot::Sender<Value>, Instant);
+
+fn closed_reply() -> Value {
+    json!({"error": "closed", "delivered": "no"})
+}
+
+/// What a panic needs to reach the relay. It lives outside the session, so
+/// it survives the session being cancelled in the middle of a step.
+#[derive(Default)]
+struct Link {
+    ws: Option<Ws>,
+    room: Option<(Arc<Invite>, Arc<RoomKeys>)>,
+    /// The relay session key and the cursor it can resume from.
+    seat: Option<(SigningKey, u64)>,
+}
 
 impl Session {
     fn new(
         shared: &Arc<Shared>,
-        invite: Invite,
-        keys: RoomKeys,
+        invite: Arc<Invite>,
+        keys: Arc<RoomKeys>,
         me: Keys,
         relay_session: SigningKey,
         cursor: u64,
     ) -> Self {
         Session {
             shared: shared.clone(),
-            invite: Arc::new(invite),
-            keys: Arc::new(keys),
+            invite,
+            keys,
             me,
             phase: Phase::Idle,
             relay_session,
             cursor,
             last_commit: 0,
-            outgoing: Vec::new(),
+            outgoing: VecDeque::new(),
             outbox: Vec::new(),
             online: true,
             replaying_to: None,
             snapshot_at: None,
             quiet_since: Instant::now(),
+            troubled_since: None,
             abandoned: None,
             fell_behind: false,
-            panic_reply: None,
             closed: None,
         }
     }
 
-    /// Terminal, and published to local waiters at once: nothing here waits
-    /// on the network.
+    /// Terminal. The session loop returns the reason at its next turn.
     fn close(&mut self, reason: &str) {
         if self.closed.is_some() {
             return;
@@ -428,12 +453,6 @@ impl Session {
         for out in self.outgoing.drain(..) {
             out.fail("closed");
         }
-        let reason = reason.to_string();
-        self.shared.update(|i| {
-            i.phase = "closed";
-            i.closed.get_or_insert(reason); // a local panic got there first
-            i.invite = None;
-        });
     }
 
     fn offline(&mut self) {
@@ -485,153 +504,121 @@ impl Session {
         }
         let jitter = u64::from(random::<1>()[0]) * u64::from(tries + 1) / 4;
         self.snapshot_at = Some(Instant::now() + Duration::from_millis(jitter));
+        self.quiet_since = Instant::now();
     }
 
-    /// Submit the message at the front of the queue, if it is sendable.
-    /// Nothing goes out while offline, while joining, or while a resumed
-    /// connection is still replaying.
-    fn pump(&mut self) {
+    /// The submission for the message at the front of the queue, if it can
+    /// go now. Called only at the moment of writing, so a send that expired
+    /// while earlier writes were in progress never leaves. Nothing goes out
+    /// while joining or while a resumed connection is still replaying.
+    fn next_submission(&mut self) -> Option<ToRelay> {
         if !self.online || self.replaying_to.is_some() || self.abandoned.is_some() {
-            return;
-        }
-        if self.shared.panicked() {
-            return; // nothing more leaves this session
+            return None;
         }
         let Phase::Active { mls } = &mut self.phase else {
-            return;
+            return None;
         };
-        while let Some(out) = self.outgoing.first_mut() {
+        loop {
+            let out = self.outgoing.front_mut()?;
             match out.state {
-                SendState::Awaiting { .. } => return,
+                SendState::Awaiting { .. } => return None,
                 // Still stale until we process the commit that overtook it.
-                SendState::Stale { after_commit } if after_commit >= self.last_commit => return,
+                SendState::Stale { after_commit } if after_commit >= self.last_commit => {
+                    return None;
+                }
                 SendState::Stale { .. } | SendState::Unsent => {}
             }
-            if out.deadline <= Instant::now() {
-                self.outgoing.remove(0).fail("timed out"); // not in flight: "no"
-                continue;
-            }
-            if out.tries >= MAX_TRIES {
-                self.outgoing.remove(0).fail("room too busy");
-                continue;
-            }
-            let data = match &out.sealed {
-                Some((under, data)) if *under == self.last_commit => data.clone(),
-                _ => match mls.encrypt(&out.text) {
-                    Ok(ct) => b64(&ct),
-                    Err(e) => {
-                        self.outgoing.remove(0).fail(&format!("could not encrypt: {e}"));
-                        continue;
-                    }
-                },
+            // Not in flight, so each of these failures means "not delivered".
+            let unsendable = if out.deadline <= Instant::now() {
+                Some("timed out".to_string())
+            } else if out.tries >= MAX_TRIES {
+                Some("room too busy".to_string())
+            } else {
+                None
+            };
+            let data = match (&out.sealed, unsendable) {
+                (_, Some(why)) => Err(why),
+                (Some((under, data)), None) if *under == self.last_commit => Ok(data.clone()),
+                _ => mls
+                    .encrypt(&out.text)
+                    .map(|ct| b64(&ct))
+                    .map_err(|e| format!("could not encrypt: {e}")),
+            };
+            let data = match data {
+                Ok(data) => data,
+                Err(why) => {
+                    self.outgoing.pop_front()?.fail(&why);
+                    continue;
+                }
             };
             out.sealed = Some((self.last_commit, data.clone()));
             out.tries += 1;
             out.state = SendState::Awaiting {
                 after_commit: self.last_commit,
             };
-            self.outbox.push(ToRelay::Submit {
+            self.quiet_since = Instant::now();
+            return Some(ToRelay::Submit {
                 id: out.id.clone(),
                 kind: Kind::App,
                 after_commit: self.last_commit,
                 data,
                 group_info: None,
             });
-            self.quiet_since = Instant::now();
-            return;
         }
     }
 
-    fn on_command(&mut self, (req, reply, arrived): Command) {
-        // Once a panic has been published, it outranks whatever was queued
-        // ahead of it.
-        if self.shared.panicked() {
-            if matches!(req, Request::Panic) {
-                self.panic_reply = Some(reply);
-            } else {
-                let _ = reply.send(json!({"error": "closed", "delivered": "no"}));
-            }
-            return self.close("panic");
-        }
-        match req {
-            Request::Send { text } => {
-                self.outgoing.push(Outgoing {
-                    id: Self::new_id(),
-                    text: text.into_bytes(),
-                    state: SendState::Unsent,
-                    sealed: None,
-                    tries: 0,
-                    deadline: arrived + SEND_DEADLINE,
-                    reply,
-                });
-                self.pump();
-            }
-            Request::Panic => {
-                self.panic_reply = Some(reply);
-                self.close("panic");
-            }
-            Request::Leave => {
-                self.close("left");
-                let _ = reply.send(json!({"ok": true}));
-            }
-            Request::Status | Request::Recv { .. } => {
-                let _ = reply.send(json!({"error": "handled elsewhere"}));
-            }
-        }
+    fn enqueue(&mut self, (text, reply, arrived): Command) {
+        self.outgoing.push_back(Outgoing {
+            id: Self::new_id(),
+            text: text.into_bytes(),
+            state: SendState::Unsent,
+            sealed: None,
+            tries: 0,
+            deadline: arrived + SEND_DEADLINE,
+            reply,
+        });
     }
 
     /// Once a second: answer sends that ran out of time. Returns true if the
-    /// connection looks dead: we are waiting on the relay for something (an
-    /// echo, a replay, our join) and it has said nothing for too long.
+    /// connection should be dropped and resumed: either a send was given up
+    /// on while in flight (the replay settles its fate), or we are waiting
+    /// on the relay for one specific thing and it has made no progress.
     fn on_tick(&mut self) -> bool {
         let now = Instant::now();
-        let mut i = 0;
-        while i < self.outgoing.len() {
-            if self.outgoing[i].deadline <= now {
-                let out = self.outgoing.remove(i);
-                if matches!(out.state, SendState::Awaiting { .. }) {
-                    self.abandoned = Some(out.id.clone());
-                }
-                out.fail("timed out");
-            } else {
-                i += 1;
+        let mut gave_up_in_flight = false;
+        let mut kept = VecDeque::new();
+        for out in self.outgoing.drain(..) {
+            if out.deadline > now {
+                kept.push_back(out);
+                continue;
             }
+            if matches!(out.state, SendState::Awaiting { .. }) {
+                self.abandoned = Some(out.id.clone());
+                gave_up_in_flight = true;
+            }
+            out.fail("timed out");
         }
-        if self.abandoned.is_some() {
-            return self.online; // resume now; the replay settles its fate
-        }
-        self.pump();
-        // Waiting on the relay for one specific thing: an echo, the commit
-        // that made a send stale, a replay, or our own join.
+        self.outgoing = kept;
         let waiting = self.replaying_to.is_some()
             || matches!(self.phase, Phase::Joining { .. })
             || matches!(
-                self.outgoing.first().map(|o| &o.state),
+                self.outgoing.front().map(|o| &o.state),
                 Some(SendState::Awaiting { .. } | SendState::Stale { .. })
             );
-        self.online && waiting && now - self.quiet_since > ECHO_DEADLINE
+        self.online
+            && (gave_up_in_flight || (waiting && now - self.quiet_since > ECHO_DEADLINE))
     }
 
     fn on_relay(&mut self, msg: FromRelay) {
-        if self.shared.panicked() {
-            return self.close("panic");
-        }
-        // The stall clock is reset only by progress on what we are waiting
-        // for, not by other participants' traffic.
-        let progress = match &msg {
-            FromRelay::Frame { .. } => self.replaying_to.is_some(),
-            FromRelay::Stale { .. } | FromRelay::Snapshot { .. } => true,
-            _ => false,
-        };
-        if progress {
-            self.quiet_since = Instant::now();
-        }
         match msg {
             FromRelay::Frame { seq, kind, id, data } => {
                 if seq != self.cursor + 1 {
                     // Sequence numbers are only meaningful on an honest relay,
                     // but a visible break is never acceptable.
                     return self.close("relay delivered frames out of order");
+                }
+                if self.replaying_to.is_some() {
+                    self.quiet_since = Instant::now(); // the replay is moving
                 }
                 self.cursor = seq;
                 match kind {
@@ -643,11 +630,11 @@ impl Session {
             FromRelay::Stale { id } => {
                 if matches!(&self.phase, Phase::Joining { commit_id, .. } if *commit_id == id) {
                     self.retry_join();
-                } else if let Some(out) = self.outgoing.iter_mut().find(|o| o.id == id) {
+                } else if let Some(out) = self.outgoing.front_mut().filter(|o| o.id == id) {
                     if let SendState::Awaiting { after_commit } = out.state {
                         out.state = SendState::Stale { after_commit };
+                        self.quiet_since = Instant::now(); // now waiting for that commit
                     }
-                    self.pump();
                 } else if self.abandoned.as_deref() == Some(id.as_str()) {
                     self.abandoned = None; // rejected, so it will never be echoed
                 }
@@ -674,15 +661,15 @@ impl Session {
     }
 
     fn on_app(&mut self, seq: u64, id: &str, data: &str) {
-        if let Some(i) = self.outgoing.iter().position(|o| o.id == id) {
+        if self.outgoing.front().is_some_and(|o| o.id == id) {
             // Our own message, now sequenced. This is the only acknowledgement.
-            let out = self.outgoing.remove(i);
+            let out = self.outgoing.pop_front().unwrap();
             let _ = out.reply.send(json!({"ok": true, "seq": seq, "id": out.id}));
-            return self.pump();
+            return;
         }
         if self.abandoned.as_deref() == Some(id) {
             self.abandoned = None;
-            return self.pump(); // ours; its sender was already told "unknown"
+            return; // ours; its sender was already told "unknown"
         }
         let Phase::Active { mls } = &mut self.phase else {
             return; // sent before our admission: not ours to read
@@ -710,6 +697,7 @@ impl Session {
                     .collect();
                 self.phase = Phase::Active { mls };
                 self.last_commit = seq;
+                self.troubled_since = None;
                 self.shared.update(|i| i.phase = "active");
                 self.shared
                     .event(json!({"type": "ready", "seq": seq, "members": members}));
@@ -748,7 +736,6 @@ impl Session {
                 self.phase = Phase::Active { mls };
             }
         }
-        self.pump();
     }
 
     /// Once a resumed connection has replayed up to the relay's head at
@@ -760,26 +747,29 @@ impl Session {
         }
         self.replaying_to = None;
         self.abandoned = None; // not in the replay, so never sequenced
-        for out in &mut self.outgoing {
+        if let Some(out) = self.outgoing.front_mut() {
             if matches!(out.state, SendState::Awaiting { .. }) {
                 out.state = SendState::Unsent;
             }
         }
-        if matches!(self.phase, Phase::Joining { .. }) {
-            self.retry_join();
+        match self.phase {
+            Phase::Joining { .. } => self.retry_join(),
+            _ => self.troubled_since = None, // back to normal
         }
-        self.pump();
     }
 
     async fn flush(&mut self, ws: &mut Ws) -> Result<(), String> {
         for m in std::mem::take(&mut self.outbox) {
             ws_send(ws, &m).await?;
         }
+        if let Some(m) = self.next_submission() {
+            ws_send(ws, &m).await?;
+        }
         Ok(())
     }
 
-    /// The connection is gone. Get back on while still serving local
-    /// commands, so a panic or leave is never stuck behind a dead network.
+    /// The connection is gone. Get back on, still accepting local sends so
+    /// their deadlines keep running.
     async fn reconnect(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<Ws, String> {
         self.offline();
         let fresh = std::mem::take(&mut self.fell_behind);
@@ -791,19 +781,17 @@ impl Session {
             fresh,
         );
         tokio::pin!(attempt);
-        let deadline = sleep(LOST_AFTER);
+        // Measured from when the trouble started, not from this attempt: a
+        // relay that accepts every resume but never completes one is lost.
+        let since = *self.troubled_since.get_or_insert_with(Instant::now);
+        let deadline = sleep_until(since + LOST_AFTER);
         tokio::pin!(deadline);
         let mut ticks = interval(Duration::from_secs(1));
         let back = loop {
             tokio::select! {
                 back = &mut attempt => break back?,
                 _ = &mut deadline => return Err("lost".into()),
-                Some(cmd) = commands.recv() => {
-                    self.on_command(cmd);
-                    if let Some(reason) = &self.closed {
-                        return Err(reason.clone());
-                    }
-                }
+                Some(cmd) = commands.recv() => self.enqueue(cmd),
                 _ = ticks.tick() => { self.on_tick(); }
             }
         };
@@ -819,13 +807,10 @@ impl Session {
                 // We missed frames for good. Anything submitted but not
                 // echoed may or may not have been delivered, and resending
                 // it could deliver it twice, so the caller is told instead.
-                let mut i = 0;
-                while i < self.outgoing.len() {
-                    if matches!(self.outgoing[i].state, SendState::Awaiting { .. }) {
-                        self.outgoing.remove(i).fail("connection lost before confirmation");
-                    } else {
-                        i += 1;
-                    }
+                let in_flight = |o: &Outgoing| matches!(o.state, SendState::Awaiting { .. });
+                if self.outgoing.front().is_some_and(in_flight) {
+                    let out = self.outgoing.pop_front().unwrap();
+                    out.fail("connection lost before confirmation");
                 }
                 self.shared.event(json!({"type": "gap"}));
                 self.abandoned = None; // a fresh seat never sees old frames
@@ -837,40 +822,14 @@ impl Session {
             }
         }
     }
-
-    /// Tell the relay about a local panic, best effort, and answer the
-    /// caller. The room is already closed locally by the time this runs.
-    async fn deliver_panic(&mut self, ws: Option<Ws>, commands: &mut mpsc::Receiver<Command>) {
-        if self.closed.as_deref() != Some("panic") {
-            return;
-        }
-        let seat = Some((self.relay_session.clone(), self.cursor));
-        let confirmed = notify_panic(ws, &self.invite, &self.keys, seat).await;
-        // The panic command itself may still be queued behind others.
-        while self.panic_reply.is_none() {
-            match commands.try_recv() {
-                Ok((Request::Panic, reply, _)) => self.panic_reply = Some(reply),
-                Ok((_, reply, _)) => {
-                    let _ = reply.send(json!({"error": "closed", "delivered": "no"}));
-                }
-                Err(_) => break,
-            }
-        }
-        if let Some(reply) = self.panic_reply.take() {
-            let _ = reply.send(json!({"ok": true, "relay_confirmed": confirmed}));
-        }
-    }
 }
 
-/// Send a panic to the relay and wait briefly for it to confirm closure.
-/// Uses the live connection if there is one, else the session's own seat,
-/// else a fresh attach. Returns whether the relay confirmed.
-async fn notify_panic(
-    ws: Option<Ws>,
-    invite: &Invite,
-    keys: &RoomKeys,
-    seat: Option<(SigningKey, u64)>,
-) -> bool {
+/// Tell the relay about a local panic and wait briefly for it to confirm
+/// closure. Tries the live connection, then the session's own seat on a new
+/// connection, then a fresh attach with the invitation. Each route gets a
+/// share of the time, so a silent one cannot starve the next. A relay that
+/// says the room is already closed counts as confirmation.
+async fn notify_panic(link: Link) -> bool {
     /// Send the panic on one connection and wait for `closed`.
     async fn over(mut ws: Ws) -> bool {
         if ws_send(&mut ws, &ToRelay::Panic).await.is_err() {
@@ -884,37 +843,45 @@ async fn notify_panic(
             }
         }
     }
-    let attempt = async {
-        // Each route falls through to the next if it fails. A relay that
-        // says the room is already closed counts as confirmation.
-        if let Some(ws) = ws {
-            if over(ws).await {
-                return true;
-            }
+    let Some((invite, keys)) = link.room else {
+        return false; // never got as far as knowing a room
+    };
+    let share = PANIC_NOTIFY / 3;
+    if let Some(ws) = link.ws {
+        if timeout(share, over(ws)).await == Ok(true) {
+            return true;
         }
-        if let Some((session, cursor)) = &seat {
-            match resume(invite, session, *cursor).await {
-                Ok((ws, _)) => {
-                    if over(ws).await {
-                        return true;
-                    }
-                }
-                Err(Fail::Closed(reason)) if reason == "closed" => return true,
-                Err(_) => {}
+    }
+    if let Some((session, cursor)) = link.seat {
+        let resumed = async {
+            match resume(&invite, &session, cursor).await {
+                Ok((ws, _)) => over(ws).await,
+                Err(Fail::Closed(reason)) => reason == "closed",
+                Err(_) => false,
             }
+        };
+        if timeout(share, resumed).await == Ok(true) {
+            return true;
         }
-        match attach(invite, keys).await {
+    }
+    let attached = async {
+        match attach(&invite, &keys).await {
             Ok(a) => over(a.ws).await,
             Err(Fail::Closed(reason)) => reason == "closed",
             Err(_) => false,
         }
     };
-    timeout(PANIC_NOTIFY, attempt).await.unwrap_or(false)
+    timeout(share, attached).await == Ok(true)
 }
 
 /// Create a room: the relay allocates the id, then we register the verifier
 /// and the first group info.
-async fn create(relay: &str, name: &str, shared: &Arc<Shared>) -> Result<(Ws, Session), String> {
+async fn create(
+    relay: &str,
+    name: &str,
+    shared: &Arc<Shared>,
+    link: &mut Link,
+) -> Result<Session, String> {
     let me = Keys::new(name);
     let relay_session = SigningKey::from_bytes(&random());
     let session_pub = relay_session.verifying_key().to_bytes();
@@ -930,14 +897,18 @@ async fn create(relay: &str, name: &str, shared: &Arc<Shared>) -> Result<(Ws, Se
         FromRelay::Challenge { room, nonce } => (room, unb64(&nonce)?),
         other => return Err(format!("relay refused create: {other:?}")),
     };
-    let invite = Invite {
+    let invite = Arc::new(Invite {
         relay: relay.to_string(),
         room,
         secret: random(),
-    };
-    let keys = RoomKeys::derive(&room, &invite.secret);
+    });
+    let keys = Arc::new(RoomKeys::derive(&room, &invite.secret));
     let mls = Mls::create(&me, &room, &keys.psk)?;
     let t = transcript("create", &room, &nonce, &session_pub, 0);
+    // From here the relay may hold the room, so a panic must be able to
+    // reach it even if we are cancelled before hearing back.
+    link.room = Some((invite.clone(), keys.clone()));
+    link.seat = Some((relay_session.clone(), 0));
     ws_send(
         &mut ws,
         &ToRelay::CreateFin {
@@ -951,6 +922,7 @@ async fn create(relay: &str, name: &str, shared: &Arc<Shared>) -> Result<(Ws, Se
         FromRelay::Attached { .. } => {}
         other => return Err(format!("relay refused create: {other:?}")),
     }
+    link.ws = Some(ws);
     let encoded = invite.encode();
     let mut session = Session::new(shared, invite, keys, me, relay_session, 0);
     session.phase = Phase::Active { mls };
@@ -959,100 +931,64 @@ async fn create(relay: &str, name: &str, shared: &Arc<Shared>) -> Result<(Ws, Se
         i.invite = Some(encoded);
         i.room = Some(room.to_string());
     });
-    Ok((ws, session))
+    Ok(session)
 }
 
-async fn join(invite: &str, name: &str, shared: &Arc<Shared>) -> Result<(Ws, Session), String> {
-    let invite = Invite::parse(invite)?;
-    let keys = RoomKeys::derive(&invite.room, &invite.secret);
+async fn join(
+    invite: &str,
+    name: &str,
+    shared: &Arc<Shared>,
+    link: &mut Link,
+) -> Result<Session, String> {
+    let invite = Arc::new(Invite::parse(invite)?);
+    let keys = Arc::new(RoomKeys::derive(&invite.room, &invite.secret));
+    // Holding the invitation is enough to close the room, joined or not.
+    link.room = Some((invite.clone(), keys.clone()));
     let a = match attach(&invite, &keys).await {
         Ok(a) => a,
         Err(Fail::Io(e) | Fail::Closed(e)) => return Err(e),
         Err(Fail::Gap) => return Err("relay reported a gap on attach".into()),
     };
+    link.ws = Some(a.ws);
     shared.update(|i| i.room = Some(invite.room.to_string()));
     let mut session = Session::new(shared, invite, keys, Keys::new(name), a.relay_session, a.head);
     session.begin_join(&a.snapshot, 0);
-    Ok((a.ws, session))
+    Ok(session)
 }
 
-/// Run a session until it closes. Returns the reason.
+/// Run a session until it closes, and return the reason. A local panic or
+/// leave does not pass through here at all: the caller simply stops polling
+/// this future, at whatever await it had reached, and `link` holds what is
+/// needed to tell the relay.
 async fn run_session(
     start: Start,
     shared: &Arc<Shared>,
     commands: &mut mpsc::Receiver<Command>,
+    link: &mut Link,
 ) -> String {
-    // Connect, still answering local commands so a launch can be abandoned.
-    let (ws, mut s) = {
-        let establishing = async {
-            match &start {
-                Start::Create { relay, name } => create(relay, name, shared).await,
-                Start::Join { invite, name } => join(invite, name, shared).await,
-            }
-        };
-        tokio::pin!(establishing);
-        loop {
-            tokio::select! {
-                done = &mut establishing => match done {
-                    Ok(x) => break x,
-                    Err(e) => return e,
-                },
-                Some((req, reply, _)) = commands.recv() => match req {
-                    Request::Leave => {
-                        let _ = reply.send(json!({"ok": true}));
-                        return "left".into();
-                    }
-                    Request::Panic => {
-                        // The handshake in flight may already hold a seat or,
-                        // for a creator, have brought the room into being.
-                        // Give it a moment to finish, so the panic goes out
-                        // on that seat.
-                        let confirmed = match timeout(PANIC_NOTIFY, &mut establishing).await {
-                            Ok(Ok((ws, s))) => {
-                                let seat = Some((s.relay_session.clone(), s.cursor));
-                                notify_panic(Some(ws), &s.invite, &s.keys, seat).await
-                            }
-                            // No seat. A joiner still holds the invitation
-                            // and can close the room with it. A creator's
-                            // room, if the relay made one, has an invitation
-                            // nobody was shown, and expires empty.
-                            _ => match &start {
-                                Start::Join { invite, .. } => match Invite::parse(invite) {
-                                    Ok(invite) => {
-                                        let keys = RoomKeys::derive(&invite.room, &invite.secret);
-                                        notify_panic(None, &invite, &keys, None).await
-                                    }
-                                    Err(_) => false,
-                                },
-                                Start::Create { .. } => false,
-                            },
-                        };
-                        let _ = reply.send(json!({"ok": true, "relay_confirmed": confirmed}));
-                        return "panic".into();
-                    }
-                    _ => { let _ = reply.send(json!({"error": "not ready", "delivered": "no"})); }
-                },
-            }
-        }
+    let made = match &start {
+        Start::Create { relay, name } => create(relay, name, shared, link).await,
+        Start::Join { invite, name } => join(invite, name, shared, link).await,
     };
-    let mut ws = Some(ws);
+    let mut s = match made {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let mut ticks = interval(Duration::from_secs(1));
     loop {
-        if s.shared.panicked() {
-            s.close("panic");
+        if let Some(reason) = &s.closed {
+            return reason.clone();
         }
-        if s.closed.is_some() {
-            break;
-        }
-        let Some(live) = ws.as_mut() else {
+        link.seat = Some((s.relay_session.clone(), s.cursor));
+        let Some(live) = link.ws.as_mut() else {
             match s.reconnect(commands).await {
-                Ok(new) => ws = Some(new),
+                Ok(new) => link.ws = Some(new),
                 Err(reason) => s.close(&reason),
             }
             continue;
         };
         if s.flush(live).await.is_err() {
-            ws = None;
+            link.ws = None;
             continue;
         }
         let mut dead = false;
@@ -1061,7 +997,7 @@ async fn run_session(
                 Ok(m) => s.on_relay(m),
                 Err(_) => dead = true,
             },
-            Some(cmd) = commands.recv() => s.on_command(cmd),
+            Some(cmd) = commands.recv() => s.enqueue(cmd),
             _ = sleep_until(s.snapshot_at.unwrap_or_else(Instant::now)), if s.snapshot_at.is_some() => {
                 s.snapshot_at = None;
                 s.quiet_since = Instant::now();
@@ -1070,13 +1006,9 @@ async fn run_session(
             _ = ticks.tick() => dead = s.on_tick(),
         }
         if dead || s.fell_behind {
-            ws = None;
+            link.ws = None;
         }
     }
-    s.deliver_panic(ws, commands).await;
-    s.closed.clone().unwrap_or_default()
-    // `s` is dropped here: the invitation-derived keys go with it. The MLS
-    // group and its key store were dropped when the session closed.
 }
 
 // -------------------------------------------------------------- local socket
@@ -1194,23 +1126,35 @@ async fn serve_local(
         Ok(Request::Recv { wait }) => {
             return serve_recv(wait, &shared, &mut lines, &mut write).await;
         }
-        Ok(req) => {
-            if matches!(req, Request::Panic) {
-                // Published here, before the session loop even hears of it:
-                // local waiters are released no matter what the network or
-                // the session is doing.
-                shared.update(|i| {
-                    i.closed.get_or_insert("panic".into());
-                    i.phase = "closed";
-                    i.invite = None;
-                });
-            }
+        // Panic and leave take effect here, at once, whatever the session
+        // or the network is doing.
+        Ok(Request::Panic) => {
+            shared.close("panic");
+            shared
+                .wait_for(|i| match (i.closed.as_deref(), i.panic_confirmed) {
+                    (Some("panic"), None) => None, // the relay is being told
+                    (Some("panic"), Some(c)) => Some(json!({"ok": true, "relay_confirmed": c})),
+                    // Someone else's panic got there first.
+                    (Some("closed"), _) => Some(json!({"ok": true, "relay_confirmed": true})),
+                    (other, _) => Some(json!({
+                        "error": format!("session already ended: {}", other.unwrap_or_default()),
+                    })),
+                })
+                .await
+        }
+        Ok(Request::Leave) => {
+            shared.close("left");
+            json!({"ok": true})
+        }
+        Ok(Request::Send { text }) => {
             let (tx, rx) = oneshot::channel();
-            if commands.send((req, tx, Instant::now())).await.is_err() {
-                json!({"error": "closed", "delivered": "no"})
+            if commands.send((text, tx, Instant::now())).await.is_err() {
+                closed_reply()
             } else {
+                // A reply that never comes means the session was stopped
+                // with this send possibly in flight.
                 rx.await
-                    .unwrap_or_else(|_| json!({"error": "closed", "delivered": "no"}))
+                    .unwrap_or_else(|_| json!({"error": "closed", "delivered": "unknown"}))
             }
         }
     };
@@ -1275,16 +1219,23 @@ pub async fn run(
         }
     });
 
-    let reason = run_session(start, &shared, &mut rx).await;
-    shared.update(|i| {
-        i.phase = "closed";
-        i.closed.get_or_insert(reason);
-        i.invite = None;
-    });
+    // A local panic or leave closes the inbox directly. That wins here and
+    // the session is dropped where it stands, keys and all.
+    let mut link = Link::default();
+    let reason = tokio::select! {
+        biased;
+        reason = shared.wait_for(|i| i.closed.clone()) => reason,
+        reason = run_session(start, &shared, &mut rx, &mut link) => reason,
+    };
+    shared.close(&reason);
     // Answer anything still queued instead of leaving callers to time out.
     rx.close();
     while let Ok((_, reply, _)) = rx.try_recv() {
-        let _ = reply.send(json!({"error": "closed", "delivered": "no"}));
+        let _ = reply.send(closed_reply());
+    }
+    if shared.inbox.lock().unwrap().closed.as_deref() == Some("panic") {
+        let confirmed = notify_panic(link).await;
+        shared.update(|i| i.panic_confirmed = Some(confirmed));
     }
     sleep(LINGER).await;
     let _ = std::fs::remove_file(&path);
