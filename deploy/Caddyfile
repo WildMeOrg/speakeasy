@@ -1,0 +1,6 @@
+# TLS in front of the relay. Caddy obtains and renews the certificate for
+# SPEAKEASY_DOMAIN by itself. No access log is configured, and none should
+# be: who connected when is the one thing this host could otherwise record.
+{$SPEAKEASY_DOMAIN} {
+	reverse_proxy relay:8787
+}
