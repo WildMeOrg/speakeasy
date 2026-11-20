@@ -4,7 +4,9 @@
 #
 # The domain must already point at this host, with ports 80 and 443 open.
 # The relay keeps everything in memory and is not reachable except through
-# Caddy. The only thing stored on disk is Caddy's TLS certificate.
+# Caddy. Neither container's output is kept, because Caddy's error log can
+# name client addresses. Caddy stores its TLS keys and certificate on disk.
+# Turn off swap on the host (`swapoff -a`), or memory can reach disk that way.
 services:
   relay:
     build:
@@ -19,6 +21,8 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    logging:
+      driver: none
     ports:
       - "80:80"
       - "443:443"

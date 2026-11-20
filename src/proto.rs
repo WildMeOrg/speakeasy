@@ -28,8 +28,9 @@ pub enum ToRelay {
         cursor: u64,
     },
     /// Close the room for everyone without taking a seat. Proven with the
-    /// invitation key, like `attach`. The answer is always `closed`: before
-    /// the challenge if there is no such room, after `auth` once it is shut.
+    /// invitation key, like `attach`. The answer is `closed`: before the
+    /// challenge if there is no such room, after `auth` once it is shut. A
+    /// room still being created, or a bad signature, gets an error.
     Close {
         room: Uuid,
     },

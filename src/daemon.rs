@@ -136,9 +136,6 @@ impl Shared {
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn ws_connect(relay: &str) -> Result<Ws, String> {
-    // TLS needs a crypto backend chosen once per process. A second call
-    // reports that one is already installed, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let url = format!("{}/ws", relay.trim_end_matches('/'));
     let (ws, _) = timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
@@ -163,8 +160,7 @@ async fn ws_next(ws: &mut Ws) -> Result<Option<FromRelay>, String> {
             Some(Ok(Message::Text(t))) => {
                 return serde_json::from_str(t.as_str()).map(Some).map_err(|e| e.to_string());
             }
-            Some(Ok(Message::Pong(_))) => return Ok(None),
-            Some(Ok(Message::Ping(_))) => continue,
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => return Ok(None),
             Some(Ok(_)) | None => return Err("relay connection ended".into()),
             Some(Err(e)) => return Err(e.to_string()),
         }
@@ -1248,7 +1244,8 @@ pub async fn run(
     }
     // The connection and the room keys go here, one way or the other.
     if shared.inbox.lock().unwrap().closed.as_deref() == Some("panic") {
-        let confirmed = notify_panic(link).await;
+        // The session may already have seen the relay close the room.
+        let confirmed = reason == "closed" || notify_panic(link).await;
         shared.update(|i| i.panic_confirmed = Some(confirmed));
     } else {
         drop(link);
