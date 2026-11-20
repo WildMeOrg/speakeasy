@@ -136,6 +136,9 @@ impl Shared {
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn ws_connect(relay: &str) -> Result<Ws, String> {
+    // TLS needs a crypto backend chosen once per process. A second call
+    // reports that one is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let url = format!("{}/ws", relay.trim_end_matches('/'));
     let (ws, _) = timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(url))
         .await

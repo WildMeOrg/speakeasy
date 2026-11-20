@@ -424,6 +424,25 @@ fn session_handles_cannot_escape_the_private_directory_and_ambiguity_is_an_error
     alice.run(&["--session", &second, "leave"]);
 }
 
+/// The TLS path must at least start. Nothing here can present a trusted
+/// certificate, so the connection fails, but as a reported error and not a
+/// crashed daemon.
+#[test]
+fn a_tls_relay_address_gets_as_far_as_a_tls_handshake() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        // Accept and hang up, which is not a TLS server's greeting.
+        while let Ok((sock, _)) = listener.accept() {
+            drop(sock);
+        }
+    });
+    let out = Agent::new().run(&["create", "--relay", &format!("wss://127.0.0.1:{port}")]);
+    assert_eq!(out.code, 1);
+    let error = out.lines[0]["error"].as_str().unwrap();
+    assert!(error.contains("relay connect failed"), "got {error}");
+}
+
 // ------------------------------------------------------------- scripted relay
 //
 // Some failures need a relay that misbehaves at an exact moment: one that
