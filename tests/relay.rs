@@ -101,6 +101,16 @@ async fn create(url: &str) -> (Client, RoomKeys) {
 
 /// Attach using `signer` as the invitation key. Returns the relay's answer.
 async fn attach_with(url: &str, room: Uuid, signer: &SigningKey) -> (Client, FromRelay) {
+    attach_signing(url, room, signer, "attach").await
+}
+
+/// Attach, signing the challenge as if it were for operation `op`.
+async fn attach_signing(
+    url: &str,
+    room: Uuid,
+    signer: &SigningKey,
+    op: &str,
+) -> (Client, FromRelay) {
     let session = SigningKey::from_bytes(&random());
     let spub = session.verifying_key().to_bytes();
     let mut c = Client {
@@ -117,7 +127,9 @@ async fn attach_with(url: &str, room: Uuid, signer: &SigningKey) -> (Client, Fro
         Some(other) => return (c, other),
         None => panic!("connection ended"),
     };
-    let t = transcript("attach", &room, &unb64(&nonce).unwrap(), &spub, 0);
+    // A close is signed over an empty session key.
+    let key: &[u8] = if op == "close" { &[] } else { &spub };
+    let t = transcript(op, &room, &unb64(&nonce).unwrap(), key, 0);
     c.send(ToRelay::Auth { sig: sign(signer, &t) }).await;
     let answer = c.recv().await.expect("no answer to auth");
     (c, answer)
@@ -523,8 +535,9 @@ async fn connections_beyond_the_cap_are_refused_before_the_upgrade() {
     let (_c, _) = attach(&url, &keys).await;
 }
 
-/// Ask the relay to close a room, proving the invitation with `signer`.
-async fn close_with(url: &str, room: Uuid, signer: &SigningKey) -> FromRelay {
+/// Ask the relay to close a room, proving the invitation with `signer` and
+/// signing the challenge as if it were for operation `op`.
+async fn close_with(url: &str, room: Uuid, signer: &SigningKey, op: &str) -> FromRelay {
     let session = SigningKey::from_bytes(&random());
     let mut c = Client {
         ws: Client::open(url).await,
@@ -536,7 +549,7 @@ async fn close_with(url: &str, room: Uuid, signer: &SigningKey) -> FromRelay {
         Some(other) => return other,
         None => panic!("no answer to close"),
     };
-    let sig = sign(signer, &transcript("close", &room, &nonce, &[], 0));
+    let sig = sign(signer, &transcript(op, &room, &nonce, &[], 0));
     c.send(ToRelay::Auth { sig }).await;
     c.recv().await.expect("no answer to auth")
 }
@@ -550,20 +563,25 @@ async fn the_invitation_alone_closes_a_full_room_and_nothing_else_does() {
     let (relay, url) = start(limits).await;
     let (mut creator, keys) = create(&url).await;
 
-    // Not a stranger, and not an attach signature replayed as a close.
+    // Not a stranger, and not the right key signing for another operation,
+    // in either direction.
     let stranger = SigningKey::from_bytes(&random());
-    let answer = close_with(&url, keys.room, &stranger).await;
+    let answer = close_with(&url, keys.room, &stranger, "close").await;
+    assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
+    let answer = close_with(&url, keys.room, &keys.invite_key, "attach").await;
+    assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
+    let (_, answer) = attach_signing(&url, keys.room, &keys.invite_key, "close").await;
     assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
     assert_eq!(relay.room_count(), 1);
 
     // The room has no free seat, and closing it needs none.
-    let answer = close_with(&url, keys.room, &keys.invite_key).await;
+    let answer = close_with(&url, keys.room, &keys.invite_key, "close").await;
     assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
     assert!(matches!(creator.recv().await, Some(FromRelay::Closed)));
     assert_eq!(relay.room_count(), 0);
 
     // A room that is gone, or never was, answers the same way at once.
-    let answer = close_with(&url, keys.room, &keys.invite_key).await;
+    let answer = close_with(&url, keys.room, &keys.invite_key, "close").await;
     assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
 }
 

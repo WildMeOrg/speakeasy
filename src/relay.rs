@@ -176,10 +176,14 @@ impl Relay {
     /// Close the room if `allowed` still holds, deciding and closing in one
     /// critical section. The room is marked closed before it leaves the map,
     /// so there is no moment when it is findable-but-gone or gone-but-open.
+    /// Returns whether the room is closed afterwards.
     fn close_if(&self, id: &Uuid, room: &RoomHandle, allowed: impl FnOnce(&Room) -> bool) -> bool {
         {
             let mut r = room.state.lock().unwrap();
-            if r.closed || !allowed(&r) {
+            if r.closed {
+                return true;
+            }
+            if !allowed(&r) {
                 return false;
             }
             r.closed = true;
@@ -542,9 +546,8 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
                 return Err(err("expected auth"));
             };
             let t = transcript("close", &id, &nonce, &[], 0);
-            relay.close_if(&id, &room, |r| verify(&r.verifier, &t, &sig));
-            // Shut by this request or by someone else's just before it.
-            if room.state.lock().unwrap().closed {
+            // Shut by this request, or by someone else's just before it.
+            if relay.close_if(&id, &room, |r| verify(&r.verifier, &t, &sig)) {
                 Err(FromRelay::Closed)
             } else {
                 Err(err("bad signature"))

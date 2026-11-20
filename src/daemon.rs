@@ -411,8 +411,8 @@ struct Session {
     /// of our submissions were sequenced, so nothing is (re)submitted.
     replaying_to: Option<u64>,
     snapshot_at: Option<Instant>,
-    /// When the relay last answered a ping on this connection, and when we
-    /// last sent one.
+    /// When we last heard anything from the relay on this connection, and
+    /// when we last pinged it.
     heard: Instant,
     pinged: Instant,
     ping_due: bool,
@@ -631,8 +631,9 @@ impl Session {
         gave_up_in_flight || now - self.heard > PONG_DEADLINE
     }
 
-    /// The relay answered a ping: the connection works in both directions.
-    fn on_pong(&mut self) {
+    /// Anything at all from the relay shows the connection is alive. The
+    /// pings exist so that there is always something to hear.
+    fn on_heard(&mut self) {
         self.heard = Instant::now();
         self.troubled_since = None;
     }
@@ -811,7 +812,7 @@ impl Session {
         );
         tokio::pin!(attempt);
         // Measured from when the trouble started, not from this attempt: a
-        // relay that accepts every resume but never answers a ping is lost.
+        // relay that accepts every resume and then says nothing is lost.
         let since = *self.troubled_since.get_or_insert_with(Instant::now);
         let deadline = sleep_until(since + LOST_AFTER);
         tokio::pin!(deadline);
@@ -824,7 +825,8 @@ impl Session {
                 _ = ticks.tick() => { self.on_tick(); }
             }
         };
-        (self.heard, self.pinged, self.ping_due) = (Instant::now(), Instant::now(), false);
+        // Ping at once, so a connection that only looks open is found out.
+        (self.heard, self.pinged, self.ping_due) = (Instant::now(), Instant::now(), true);
         match back {
             Back::Resumed(ws, head) => {
                 self.replaying_to = Some(head);
@@ -865,14 +867,16 @@ impl Drop for Session {
 /// needs only the invitation. Each gets half the time, so a silent
 /// connection cannot starve the other route.
 async fn notify_panic(link: Link) -> bool {
-    /// Send the panic on one connection and wait for `closed`.
-    async fn over(mut ws: Ws) -> bool {
+    /// Send the panic on one connection and wait for `closed`. Notes if
+    /// the relay says on the way that our room was created.
+    async fn over(mut ws: Ws, creating: &mut bool) -> bool {
         if ws_send(&mut ws, &ToRelay::Panic).await.is_err() {
             return false;
         }
         loop {
             match ws_recv(&mut ws).await {
                 Ok(FromRelay::Closed) => return true,
+                Ok(FromRelay::Attached { .. }) => *creating = false,
                 Ok(_) => continue,
                 Err(_) => return false,
             }
@@ -881,16 +885,17 @@ async fn notify_panic(link: Link) -> bool {
     let Some((invite, keys)) = link.room else {
         return false; // never got as far as knowing a room
     };
+    let mut creating = link.creating;
     let half = PANIC_NOTIFY / 2;
     if let Some(ws) = link.ws {
-        if timeout(half, over(ws)).await == Ok(true) {
+        if timeout(half, over(ws, &mut creating)).await == Ok(true) {
             return true;
         }
     }
     match timeout(half, close_room(&invite, &keys)).await {
         // "No such room" is as good as closed, except while our own request
         // to create it may still be on its way.
-        Ok(Ok(existed)) => existed || !link.creating,
+        Ok(Ok(existed)) => existed || !creating,
         _ => false,
     }
 }
@@ -1015,8 +1020,12 @@ async fn run_session(
         let mut dead = false;
         tokio::select! {
             msg = ws_next(live) => match msg {
-                Ok(Some(m)) => s.on_relay(m),
-                Ok(None) => s.on_pong(),
+                Ok(m) => {
+                    s.on_heard();
+                    if let Some(m) = m {
+                        s.on_relay(m);
+                    }
+                }
                 Err(_) => dead = true,
             },
             Some(cmd) = commands.recv() => s.enqueue(cmd),
