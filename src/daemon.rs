@@ -1003,15 +1003,30 @@ async fn run_session(
                         return "left".into();
                     }
                     Request::Panic => {
-                        // Not in the room yet, but a joiner holds the
-                        // invitation and can still close it.
-                        let mut confirmed = false;
-                        if let Start::Join { invite, .. } = &start {
-                            if let Ok(invite) = Invite::parse(invite) {
-                                let keys = RoomKeys::derive(&invite.room, &invite.secret);
-                                confirmed = notify_panic(None, &invite, &keys, None).await;
+                        // The handshake in flight may already hold a seat or,
+                        // for a creator, have brought the room into being.
+                        // Give it a moment to finish, so the panic goes out
+                        // on that seat.
+                        let confirmed = match timeout(PANIC_NOTIFY, &mut establishing).await {
+                            Ok(Ok((ws, s))) => {
+                                let seat = Some((s.relay_session.clone(), s.cursor));
+                                notify_panic(Some(ws), &s.invite, &s.keys, seat).await
                             }
-                        }
+                            // No seat. A joiner still holds the invitation
+                            // and can close the room with it. A creator's
+                            // room, if the relay made one, has an invitation
+                            // nobody was shown, and expires empty.
+                            _ => match &start {
+                                Start::Join { invite, .. } => match Invite::parse(invite) {
+                                    Ok(invite) => {
+                                        let keys = RoomKeys::derive(&invite.room, &invite.secret);
+                                        notify_panic(None, &invite, &keys, None).await
+                                    }
+                                    Err(_) => false,
+                                },
+                                Start::Create { .. } => false,
+                            },
+                        };
                         let _ = reply.send(json!({"ok": true, "relay_confirmed": confirmed}));
                         return "panic".into();
                     }

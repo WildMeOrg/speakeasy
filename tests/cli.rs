@@ -423,3 +423,252 @@ fn session_handles_cannot_escape_the_private_directory_and_ambiguity_is_an_error
     assert_eq!((out.code, &out.lines[0]["name"]), (0, &serde_json::json!("alice-2")));
     alice.run(&["--session", &second, "leave"]);
 }
+
+// ------------------------------------------------------------- scripted relay
+//
+// Some failures need a relay that misbehaves at an exact moment: one that
+// sequences a message and loses the echo, or stalls half way through a
+// handshake. These tests play the relay's side of the wire by hand.
+
+mod scripted {
+    use std::future::Future;
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use speakeasy::crypto::b64;
+    use speakeasy::proto::{FromRelay, Kind, ToRelay};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::runtime::Runtime;
+    use tokio::task::JoinHandle;
+    use tokio::time::{sleep, timeout};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use uuid::Uuid;
+
+    pub type Sock = WebSocketStream<TcpStream>;
+
+    pub struct Scripted<T> {
+        pub url: String,
+        rt: Runtime,
+        script: JoinHandle<T>,
+    }
+
+    impl<T> Scripted<T> {
+        /// Wait for the script to finish; a panic inside it fails the test.
+        pub fn finish(self) -> T {
+            let script = self.script;
+            self.rt
+                .block_on(async { timeout(Duration::from_secs(20), script).await })
+                .expect("relay script did not finish")
+                .expect("relay script failed")
+        }
+    }
+
+    pub fn relay<F, Fut>(script: F) -> Scripted<Fut::Output>
+    where
+        F: FnOnce(TcpListener) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let rt = Runtime::new().unwrap();
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let script = rt.spawn(script(listener));
+        Scripted { url, rt, script }
+    }
+
+    async fn accept(l: &TcpListener) -> Sock {
+        let (stream, _) = l.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    }
+
+    async fn rx(ws: &mut Sock) -> ToRelay {
+        loop {
+            match ws.next().await.expect("daemon hung up").unwrap() {
+                Message::Text(t) => return serde_json::from_str(t.as_str()).unwrap(),
+                _ => continue,
+            }
+        }
+    }
+
+    async fn tx(ws: &mut Sock, m: FromRelay) {
+        let text = serde_json::to_string(&m).unwrap();
+        ws.send(Message::Text(text.into())).await.unwrap();
+    }
+
+    fn challenge(room: Uuid) -> FromRelay {
+        FromRelay::Challenge {
+            room,
+            nonce: b64(&[7; 32]),
+        }
+    }
+
+    /// The relay's part of creating a room, up to but not including the
+    /// final `attached`. Returns the creator's sealed group info.
+    async fn begin_create(l: &TcpListener) -> (Sock, Uuid, String) {
+        let mut ws = accept(l).await;
+        let ToRelay::Create { .. } = rx(&mut ws).await else {
+            panic!("expected create")
+        };
+        let room = Uuid::new_v4();
+        tx(&mut ws, challenge(room)).await;
+        let ToRelay::CreateFin { group_info, .. } = rx(&mut ws).await else {
+            panic!("expected create_fin")
+        };
+        (ws, room, group_info)
+    }
+
+    fn attached(head: u64, group_info: String) -> FromRelay {
+        FromRelay::Attached {
+            head,
+            last_commit: 0,
+            group_info,
+        }
+    }
+
+    /// What the relay turns out to have done with a message whose echo the
+    /// sender never saw.
+    #[derive(Clone, Copy)]
+    pub enum Fate {
+        /// Sequenced: the replay after resume contains it.
+        Sequenced,
+        /// Not sequenced: the replay is complete and does not contain it.
+        NotSequenced,
+        /// Unknowable: the relay no longer has the frames to replay.
+        Unknowable,
+    }
+
+    /// Take one message from the creator, drop the connection without
+    /// echoing it, then answer the reconnect according to `fate`.
+    pub async fn lose_an_echo(l: TcpListener, fate: Fate) -> Sock {
+        let (mut ws, room, group_info) = begin_create(&l).await;
+        tx(&mut ws, attached(0, group_info.clone())).await;
+        let ToRelay::Submit { id, data, kind: Kind::App, .. } = rx(&mut ws).await else {
+            panic!("expected a message")
+        };
+        drop(ws);
+
+        let mut ws = accept(&l).await;
+        let ToRelay::Resume { cursor: 0, .. } = rx(&mut ws).await else {
+            panic!("expected resume from 0")
+        };
+        tx(&mut ws, challenge(room)).await;
+        let ToRelay::Auth { .. } = rx(&mut ws).await else {
+            panic!("expected auth")
+        };
+        let echo = |id: String, data: String| FromRelay::Frame {
+            seq: 1,
+            kind: Kind::App,
+            id,
+            data,
+        };
+        match fate {
+            Fate::Sequenced => {
+                tx(&mut ws, FromRelay::Resumed { head: 1 }).await;
+                tx(&mut ws, echo(id, data)).await;
+            }
+            Fate::NotSequenced => {
+                tx(&mut ws, FromRelay::Resumed { head: 0 }).await;
+                let ToRelay::Submit { id: again, data: same, kind: Kind::App, .. } =
+                    rx(&mut ws).await
+                else {
+                    panic!("expected the message again")
+                };
+                // The same submission, byte for byte: not a second message.
+                assert_eq!((&again, &same), (&id, &data));
+                tx(&mut ws, echo(id, data)).await;
+            }
+            Fate::Unknowable => {
+                tx(&mut ws, FromRelay::Gap).await;
+                drop(ws);
+                ws = accept(&l).await;
+                let ToRelay::Attach { .. } = rx(&mut ws).await else {
+                    panic!("expected attach")
+                };
+                tx(&mut ws, challenge(room)).await;
+                let ToRelay::Auth { .. } = rx(&mut ws).await else {
+                    panic!("expected auth")
+                };
+                tx(&mut ws, attached(1, group_info)).await;
+                let ToRelay::Submit { id, data, kind: Kind::Commit, .. } = rx(&mut ws).await
+                else {
+                    panic!("expected the rejoin commit")
+                };
+                let (seq, kind) = (2, Kind::Commit);
+                tx(&mut ws, FromRelay::Frame { seq, kind, id, data }).await;
+            }
+        }
+        // Whatever happened, the message is never submitted again.
+        let more = timeout(Duration::from_secs(2), rx(&mut ws)).await;
+        assert!(more.is_err(), "unexpected submission: {more:?}");
+        ws
+    }
+
+    /// Bring the room into being, but hold back the final `attached` for a
+    /// while. Returns what the creator sent once it arrived.
+    pub async fn stall_create(l: TcpListener, tell: std::sync::mpsc::Sender<()>) -> ToRelay {
+        let (mut ws, _, group_info) = begin_create(&l).await;
+        tell.send(()).unwrap();
+        sleep(Duration::from_millis(700)).await;
+        tx(&mut ws, attached(0, group_info)).await;
+        let next = rx(&mut ws).await;
+        tx(&mut ws, FromRelay::Closed).await;
+        next
+    }
+}
+
+use scripted::Fate;
+
+/// Create a room on a relay that loses the echo of the first message, send
+/// one message, and return what `send` reported.
+fn send_with_lost_echo(fate: Fate) -> Output {
+    let relay = scripted::relay(move |l| scripted::lose_an_echo(l, fate));
+    let alice = Agent::new();
+    let out = alice.run(&["create", "--relay", &relay.url, "--name", "alice"]);
+    assert_eq!(out.code, 0, "{:?}", out.lines);
+    let out = alice.run_with(&["send"], Some("hello"));
+    let _open = relay.finish();
+    out
+}
+
+#[test]
+fn a_send_sequenced_before_the_connection_dropped_is_confirmed_by_the_replay() {
+    let out = send_with_lost_echo(Fate::Sequenced);
+    assert_eq!(out.code, 0, "{:?}", out.lines);
+    assert_eq!((&out.lines[0]["ok"], &out.lines[0]["seq"]), (&true.into(), &1.into()));
+}
+
+#[test]
+fn a_send_the_replay_proves_unsequenced_is_submitted_again_unchanged() {
+    let out = send_with_lost_echo(Fate::NotSequenced);
+    assert_eq!(out.code, 0, "{:?}", out.lines);
+    assert_eq!(out.lines[0]["ok"], true);
+}
+
+#[test]
+fn a_send_whose_fate_cannot_be_known_is_reported_as_unknown_and_not_resent() {
+    let out = send_with_lost_echo(Fate::Unknowable);
+    assert_eq!(out.code, 1, "{:?}", out.lines);
+    assert_eq!(out.lines[0]["delivered"], "unknown");
+}
+
+#[test]
+fn panic_while_the_room_is_being_created_still_closes_it_at_the_relay() {
+    let (tell, registered) = std::sync::mpsc::channel();
+    let relay = scripted::relay(move |l| scripted::stall_create(l, tell));
+    let alice = Arc::new(Agent::new());
+    let creating = {
+        let (alice, url) = (alice.clone(), relay.url.clone());
+        std::thread::spawn(move || alice.run(&["create", "--relay", &url, "--name", "alice"]))
+    };
+    // The relay now has the room, but the creator has not heard so.
+    registered.recv_timeout(Duration::from_secs(10)).unwrap();
+    let out = alice.run(&["panic"]);
+    assert_eq!(out.code, 0, "{:?}", out.lines);
+    assert_eq!(out.lines[0]["relay_confirmed"], true);
+    assert!(matches!(relay.finish(), speakeasy::proto::ToRelay::Panic));
+    // The launch reports the panic and never prints an invitation.
+    let out = creating.join().unwrap();
+    assert_eq!(out.code, 1, "{:?}", out.lines);
+    assert_eq!(out.lines[0]["error"], "panic");
+}
