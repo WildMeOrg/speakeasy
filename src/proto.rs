@@ -27,6 +27,12 @@ pub enum ToRelay {
         session_key: String,
         cursor: u64,
     },
+    /// Close the room for everyone without taking a seat. Proven with the
+    /// invitation key, like `attach`. The answer is always `closed`: before
+    /// the challenge if there is no such room, after `auth` once it is shut.
+    Close {
+        room: Uuid,
+    },
     // --- answers to the challenge ---
     CreateFin {
         verifier: String,

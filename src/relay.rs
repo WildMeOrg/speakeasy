@@ -535,7 +535,23 @@ async fn handshake(relay: &Arc<Relay>, conn: &mut Conn) -> Result<(Seat, FromRel
             Ok((seat, FromRelay::Resumed { head }))
         }
 
-        _ => Err(err("expected create, attach or resume")),
+        ToRelay::Close { room: id } => {
+            let room = relay.lookup(&id).ok_or(FromRelay::Closed)?;
+            let nonce = challenge(conn, id).await?;
+            let Some(ToRelay::Auth { sig }) = conn.recv().await else {
+                return Err(err("expected auth"));
+            };
+            let t = transcript("close", &id, &nonce, &[], 0);
+            relay.close_if(&id, &room, |r| verify(&r.verifier, &t, &sig));
+            // Shut by this request or by someone else's just before it.
+            if room.state.lock().unwrap().closed {
+                Err(FromRelay::Closed)
+            } else {
+                Err(err("bad signature"))
+            }
+        }
+
+        _ => Err(err("expected create, attach, resume or close")),
     }
 }
 

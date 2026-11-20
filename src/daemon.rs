@@ -27,9 +27,10 @@ const MAX_TRIES: u32 = 50;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// A send that has not been resolved by then is answered with what is known.
 pub const SEND_DEADLINE: Duration = Duration::from_secs(60);
-/// No echo for this long on a live connection means the connection is not
-/// really live: drop it and resume, which settles what was sequenced.
-const ECHO_DEADLINE: Duration = Duration::from_secs(15);
+/// How often the relay is pinged, and how long it may go without answering
+/// before the connection is treated as dead and resumed.
+const PING_EVERY: Duration = Duration::from_secs(10);
+const PONG_DEADLINE: Duration = Duration::from_secs(30);
 /// Give up and erase keys if the relay stays unreachable this long.
 const LOST_AFTER: Duration = Duration::from_secs(120);
 /// How long a panic waits for the relay to confirm before answering anyway.
@@ -151,15 +152,26 @@ async fn ws_send(ws: &mut Ws, m: &ToRelay) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-async fn ws_recv(ws: &mut Ws) -> Result<FromRelay, String> {
+/// The next thing from the relay: a protocol message, or `None` for the
+/// answer to one of our pings.
+async fn ws_next(ws: &mut Ws) -> Result<Option<FromRelay>, String> {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(t))) => {
-                return serde_json::from_str(t.as_str()).map_err(|e| e.to_string());
+                return serde_json::from_str(t.as_str()).map(Some).map_err(|e| e.to_string());
             }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Pong(_))) => return Ok(None),
+            Some(Ok(Message::Ping(_))) => continue,
             Some(Ok(_)) | None => return Err("relay connection ended".into()),
             Some(Err(e)) => return Err(e.to_string()),
+        }
+    }
+}
+
+async fn ws_recv(ws: &mut Ws) -> Result<FromRelay, String> {
+    loop {
+        if let Some(m) = ws_next(ws).await? {
+            return Ok(m);
         }
     }
 }
@@ -273,6 +285,25 @@ async fn resume(invite: &Invite, session: &SigningKey, cursor: u64) -> Result<(W
     }
 }
 
+/// Close the room using only the invitation: no seat, no cursor. Returns
+/// whether the relay knew the room (true) or had no such room (false).
+async fn close_room(invite: &Invite, keys: &RoomKeys) -> Result<bool, String> {
+    let mut ws = ws_connect(&invite.relay).await?;
+    ws_send(&mut ws, &ToRelay::Close { room: invite.room }).await?;
+    let nonce = match ws_expect(&mut ws).await? {
+        FromRelay::Challenge { room, nonce } if room == invite.room => unb64(&nonce)?,
+        FromRelay::Closed => return Ok(false),
+        other => return Err(format!("relay refused close: {other:?}")),
+    };
+    let t = transcript("close", &invite.room, &nonce, &[], 0);
+    let sig = sign(&keys.invite_key, &t);
+    ws_send(&mut ws, &ToRelay::Auth { sig }).await?;
+    match ws_expect(&mut ws).await? {
+        FromRelay::Closed => Ok(true),
+        other => Err(format!("relay refused close: {other:?}")),
+    }
+}
+
 enum Back {
     Resumed(Ws, u64),
     Fresh(Attached),
@@ -374,16 +405,18 @@ struct Session {
     last_commit: u64,
     /// Local sends in the order they were made.
     outgoing: VecDeque<Outgoing>,
-    /// Messages for the current connection. Only filled while online.
+    /// Messages for the current connection.
     outbox: Vec<ToRelay>,
-    online: bool,
     /// After a resume: until the cursor reaches this, we cannot know which
     /// of our submissions were sequenced, so nothing is (re)submitted.
     replaying_to: Option<u64>,
     snapshot_at: Option<Instant>,
-    /// When the thing we are waiting on the relay for last made progress.
-    quiet_since: Instant,
-    /// When the connection first went wrong, until it is working again.
+    /// When the relay last answered a ping on this connection, and when we
+    /// last sent one.
+    heard: Instant,
+    pinged: Instant,
+    ping_due: bool,
+    /// When the connection first went wrong, until the relay answers again.
     troubled_since: Option<Instant>,
     /// A send we stopped waiting for while it was in flight. Its echo may
     /// still arrive and must not be mistaken for someone else's message.
@@ -407,8 +440,8 @@ fn closed_reply() -> Value {
 struct Link {
     ws: Option<Ws>,
     room: Option<(Arc<Invite>, Arc<RoomKeys>)>,
-    /// The relay session key and the cursor it can resume from.
-    seat: Option<(SigningKey, u64)>,
+    /// A request to create the room has been sent and not yet answered.
+    creating: bool,
 }
 
 impl Session {
@@ -431,10 +464,11 @@ impl Session {
             last_commit: 0,
             outgoing: VecDeque::new(),
             outbox: Vec::new(),
-            online: true,
             replaying_to: None,
             snapshot_at: None,
-            quiet_since: Instant::now(),
+            heard: Instant::now(),
+            pinged: Instant::now(),
+            ping_due: false,
             troubled_since: None,
             abandoned: None,
             fell_behind: false,
@@ -453,12 +487,6 @@ impl Session {
         for out in self.outgoing.drain(..) {
             out.fail("closed");
         }
-    }
-
-    fn offline(&mut self) {
-        self.online = false;
-        self.outbox.clear();
-        self.snapshot_at = None;
     }
 
     fn new_id() -> String {
@@ -489,7 +517,6 @@ impl Session {
             commit_id,
             tries,
         };
-        self.quiet_since = Instant::now();
         self.shared.update(|i| i.phase = "joining");
     }
 
@@ -504,7 +531,6 @@ impl Session {
         }
         let jitter = u64::from(random::<1>()[0]) * u64::from(tries + 1) / 4;
         self.snapshot_at = Some(Instant::now() + Duration::from_millis(jitter));
-        self.quiet_since = Instant::now();
     }
 
     /// The submission for the message at the front of the queue, if it can
@@ -512,7 +538,7 @@ impl Session {
     /// while earlier writes were in progress never leaves. Nothing goes out
     /// while joining or while a resumed connection is still replaying.
     fn next_submission(&mut self) -> Option<ToRelay> {
-        if !self.online || self.replaying_to.is_some() || self.abandoned.is_some() {
+        if self.replaying_to.is_some() || self.abandoned.is_some() {
             return None;
         }
         let Phase::Active { mls } = &mut self.phase else {
@@ -556,7 +582,6 @@ impl Session {
             out.state = SendState::Awaiting {
                 after_commit: self.last_commit,
             };
-            self.quiet_since = Instant::now();
             return Some(ToRelay::Submit {
                 id: out.id.clone(),
                 kind: Kind::App,
@@ -579,10 +604,10 @@ impl Session {
         });
     }
 
-    /// Once a second: answer sends that ran out of time. Returns true if the
-    /// connection should be dropped and resumed: either a send was given up
-    /// on while in flight (the replay settles its fate), or we are waiting
-    /// on the relay for one specific thing and it has made no progress.
+    /// Once a second: answer sends that ran out of time and keep the
+    /// heartbeat going. Returns true if the connection should be dropped and
+    /// resumed: either a send was given up on while in flight (the replay
+    /// settles its fate), or the relay has stopped answering pings.
     fn on_tick(&mut self) -> bool {
         let now = Instant::now();
         let mut gave_up_in_flight = false;
@@ -599,14 +624,17 @@ impl Session {
             out.fail("timed out");
         }
         self.outgoing = kept;
-        let waiting = self.replaying_to.is_some()
-            || matches!(self.phase, Phase::Joining { .. })
-            || matches!(
-                self.outgoing.front().map(|o| &o.state),
-                Some(SendState::Awaiting { .. } | SendState::Stale { .. })
-            );
-        self.online
-            && (gave_up_in_flight || (waiting && now - self.quiet_since > ECHO_DEADLINE))
+        if now - self.pinged >= PING_EVERY {
+            self.pinged = now;
+            self.ping_due = true;
+        }
+        gave_up_in_flight || now - self.heard > PONG_DEADLINE
+    }
+
+    /// The relay answered a ping: the connection works in both directions.
+    fn on_pong(&mut self) {
+        self.heard = Instant::now();
+        self.troubled_since = None;
     }
 
     fn on_relay(&mut self, msg: FromRelay) {
@@ -616,9 +644,6 @@ impl Session {
                     // Sequence numbers are only meaningful on an honest relay,
                     // but a visible break is never acceptable.
                     return self.close("relay delivered frames out of order");
-                }
-                if self.replaying_to.is_some() {
-                    self.quiet_since = Instant::now(); // the replay is moving
                 }
                 self.cursor = seq;
                 match kind {
@@ -633,7 +658,6 @@ impl Session {
                 } else if let Some(out) = self.outgoing.front_mut().filter(|o| o.id == id) {
                     if let SendState::Awaiting { after_commit } = out.state {
                         out.state = SendState::Stale { after_commit };
-                        self.quiet_since = Instant::now(); // now waiting for that commit
                     }
                 } else if self.abandoned.as_deref() == Some(id.as_str()) {
                     self.abandoned = None; // rejected, so it will never be echoed
@@ -697,7 +721,6 @@ impl Session {
                     .collect();
                 self.phase = Phase::Active { mls };
                 self.last_commit = seq;
-                self.troubled_since = None;
                 self.shared.update(|i| i.phase = "active");
                 self.shared
                     .event(json!({"type": "ready", "seq": seq, "members": members}));
@@ -752,13 +775,18 @@ impl Session {
                 out.state = SendState::Unsent;
             }
         }
-        match self.phase {
-            Phase::Joining { .. } => self.retry_join(),
-            _ => self.troubled_since = None, // back to normal
+        if matches!(self.phase, Phase::Joining { .. }) {
+            self.retry_join();
         }
     }
 
     async fn flush(&mut self, ws: &mut Ws) -> Result<(), String> {
+        if std::mem::take(&mut self.ping_due) {
+            timeout(IO_TIMEOUT, ws.send(Message::Ping(Default::default())))
+                .await
+                .map_err(|_| "relay write timed out".to_string())?
+                .map_err(|e| e.to_string())?;
+        }
         for m in std::mem::take(&mut self.outbox) {
             ws_send(ws, &m).await?;
         }
@@ -771,7 +799,8 @@ impl Session {
     /// The connection is gone. Get back on, still accepting local sends so
     /// their deadlines keep running.
     async fn reconnect(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<Ws, String> {
-        self.offline();
+        self.outbox.clear();
+        self.snapshot_at = None;
         let fresh = std::mem::take(&mut self.fell_behind);
         let attempt = reestablish(
             self.invite.clone(),
@@ -782,7 +811,7 @@ impl Session {
         );
         tokio::pin!(attempt);
         // Measured from when the trouble started, not from this attempt: a
-        // relay that accepts every resume but never completes one is lost.
+        // relay that accepts every resume but never answers a ping is lost.
         let since = *self.troubled_since.get_or_insert_with(Instant::now);
         let deadline = sleep_until(since + LOST_AFTER);
         tokio::pin!(deadline);
@@ -795,8 +824,7 @@ impl Session {
                 _ = ticks.tick() => { self.on_tick(); }
             }
         };
-        self.online = true;
-        self.quiet_since = Instant::now();
+        (self.heard, self.pinged, self.ping_due) = (Instant::now(), Instant::now(), false);
         match back {
             Back::Resumed(ws, head) => {
                 self.replaying_to = Some(head);
@@ -824,11 +852,18 @@ impl Session {
     }
 }
 
+/// A session stopped mid-step still answers its senders with what is known
+/// about each message.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.close("closed");
+    }
+}
+
 /// Tell the relay about a local panic and wait briefly for it to confirm
-/// closure. Tries the live connection, then the session's own seat on a new
-/// connection, then a fresh attach with the invitation. Each route gets a
-/// share of the time, so a silent one cannot starve the next. A relay that
-/// says the room is already closed counts as confirmation.
+/// closure. Tries the live connection, then a separate close request that
+/// needs only the invitation. Each gets half the time, so a silent
+/// connection cannot starve the other route.
 async fn notify_panic(link: Link) -> bool {
     /// Send the panic on one connection and wait for `closed`.
     async fn over(mut ws: Ws) -> bool {
@@ -846,32 +881,18 @@ async fn notify_panic(link: Link) -> bool {
     let Some((invite, keys)) = link.room else {
         return false; // never got as far as knowing a room
     };
-    let share = PANIC_NOTIFY / 3;
+    let half = PANIC_NOTIFY / 2;
     if let Some(ws) = link.ws {
-        if timeout(share, over(ws)).await == Ok(true) {
+        if timeout(half, over(ws)).await == Ok(true) {
             return true;
         }
     }
-    if let Some((session, cursor)) = link.seat {
-        let resumed = async {
-            match resume(&invite, &session, cursor).await {
-                Ok((ws, _)) => over(ws).await,
-                Err(Fail::Closed(reason)) => reason == "closed",
-                Err(_) => false,
-            }
-        };
-        if timeout(share, resumed).await == Ok(true) {
-            return true;
-        }
+    match timeout(half, close_room(&invite, &keys)).await {
+        // "No such room" is as good as closed, except while our own request
+        // to create it may still be on its way.
+        Ok(Ok(existed)) => existed || !link.creating,
+        _ => false,
     }
-    let attached = async {
-        match attach(&invite, &keys).await {
-            Ok(a) => over(a.ws).await,
-            Err(Fail::Closed(reason)) => reason == "closed",
-            Err(_) => false,
-        }
-    };
-    timeout(share, attached).await == Ok(true)
 }
 
 /// Create a room: the relay allocates the id, then we register the verifier
@@ -905,12 +926,13 @@ async fn create(
     let keys = Arc::new(RoomKeys::derive(&room, &invite.secret));
     let mls = Mls::create(&me, &room, &keys.psk)?;
     let t = transcript("create", &room, &nonce, &session_pub, 0);
-    // From here the relay may hold the room, so a panic must be able to
-    // reach it even if we are cancelled before hearing back.
+    // From here the relay may hold the room. If we are cancelled before
+    // hearing back, a panic follows the request down this same connection.
     link.room = Some((invite.clone(), keys.clone()));
-    link.seat = Some((relay_session.clone(), 0));
+    link.creating = true;
+    let ws = link.ws.insert(ws);
     ws_send(
-        &mut ws,
+        ws,
         &ToRelay::CreateFin {
             verifier: b64(&keys.verifier()),
             sig: sign(&keys.invite_key, &t),
@@ -918,11 +940,11 @@ async fn create(
         },
     )
     .await?;
-    match ws_expect(&mut ws).await? {
+    match ws_expect(ws).await? {
         FromRelay::Attached { .. } => {}
         other => return Err(format!("relay refused create: {other:?}")),
     }
-    link.ws = Some(ws);
+    link.creating = false;
     let encoded = invite.encode();
     let mut session = Session::new(shared, invite, keys, me, relay_session, 0);
     session.phase = Phase::Active { mls };
@@ -979,7 +1001,6 @@ async fn run_session(
         if let Some(reason) = &s.closed {
             return reason.clone();
         }
-        link.seat = Some((s.relay_session.clone(), s.cursor));
         let Some(live) = link.ws.as_mut() else {
             match s.reconnect(commands).await {
                 Ok(new) => link.ws = Some(new),
@@ -993,14 +1014,14 @@ async fn run_session(
         }
         let mut dead = false;
         tokio::select! {
-            msg = ws_recv(live) => match msg {
-                Ok(m) => s.on_relay(m),
+            msg = ws_next(live) => match msg {
+                Ok(Some(m)) => s.on_relay(m),
+                Ok(None) => s.on_pong(),
                 Err(_) => dead = true,
             },
             Some(cmd) = commands.recv() => s.enqueue(cmd),
             _ = sleep_until(s.snapshot_at.unwrap_or_else(Instant::now)), if s.snapshot_at.is_some() => {
                 s.snapshot_at = None;
-                s.quiet_since = Instant::now();
                 s.outbox.push(ToRelay::Snapshot);
             }
             _ = ticks.tick() => dead = s.on_tick(),
@@ -1194,29 +1215,19 @@ pub async fn run(
     // Report readiness as soon as the session is in the room or has failed.
     let (watch_shared, handle_owned) = (shared.clone(), handle.to_string());
     tokio::spawn(async move {
-        let mut tick = watch_shared.tick.subscribe();
-        loop {
-            let outcome = {
-                let i = watch_shared.inbox.lock().unwrap();
-                if let Some(reason) = &i.closed {
-                    Some(json!({"error": reason}))
-                } else if i.phase == "active" {
-                    let mut out = json!({"session": handle_owned, "room": i.room, "name": i.name});
-                    if let Some(invite) = &i.invite {
-                        out["invite"] = json!(invite);
-                    }
-                    Some(out)
-                } else {
-                    None
+        let outcome = watch_shared.wait_for(|i| {
+            if let Some(reason) = &i.closed {
+                return Some(json!({"error": reason}));
+            }
+            (i.phase == "active").then(|| {
+                let mut out = json!({"session": handle_owned, "room": i.room, "name": i.name});
+                if let Some(invite) = &i.invite {
+                    out["invite"] = json!(invite);
                 }
-            };
-            if let Some(outcome) = outcome {
-                return ready(outcome);
-            }
-            if tick.changed().await.is_err() {
-                return;
-            }
-        }
+                out
+            })
+        });
+        ready(outcome.await);
     });
 
     // A local panic or leave closes the inbox directly. That wins here and
@@ -1233,9 +1244,12 @@ pub async fn run(
     while let Ok((_, reply, _)) = rx.try_recv() {
         let _ = reply.send(closed_reply());
     }
+    // The connection and the room keys go here, one way or the other.
     if shared.inbox.lock().unwrap().closed.as_deref() == Some("panic") {
         let confirmed = notify_panic(link).await;
         shared.update(|i| i.panic_confirmed = Some(confirmed));
+    } else {
+        drop(link);
     }
     sleep(LINGER).await;
     let _ = std::fs::remove_file(&path);

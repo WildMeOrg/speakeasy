@@ -615,21 +615,11 @@ mod scripted {
         ws
     }
 
-    /// Bring the room into being but never say so. The creator, once it
-    /// panics, has to come back for the room on a new connection. Returns
-    /// what it sent there.
+    /// Bring the room into being but never say so. Returns what the
+    /// creator sends next on that connection.
     pub async fn stall_create(l: TcpListener, tell: std::sync::mpsc::Sender<()>) -> ToRelay {
-        let (_stalled, room, _) = begin_create(&l).await;
+        let (mut ws, _, _) = begin_create(&l).await;
         tell.send(()).unwrap();
-        let mut ws = accept(&l).await;
-        let ToRelay::Resume { cursor: 0, .. } = rx(&mut ws).await else {
-            panic!("expected resume from 0")
-        };
-        tx(&mut ws, challenge(room)).await;
-        let ToRelay::Auth { .. } = rx(&mut ws).await else {
-            panic!("expected auth")
-        };
-        tx(&mut ws, FromRelay::Resumed { head: 0 }).await;
         let next = rx(&mut ws).await;
         tx(&mut ws, FromRelay::Closed).await;
         next

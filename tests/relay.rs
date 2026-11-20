@@ -522,3 +522,56 @@ async fn connections_beyond_the_cap_are_refused_before_the_upgrade() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (_c, _) = attach(&url, &keys).await;
 }
+
+/// Ask the relay to close a room, proving the invitation with `signer`.
+async fn close_with(url: &str, room: Uuid, signer: &SigningKey) -> FromRelay {
+    let session = SigningKey::from_bytes(&random());
+    let mut c = Client {
+        ws: Client::open(url).await,
+        session,
+    };
+    c.send(ToRelay::Close { room }).await;
+    let nonce = match c.recv().await {
+        Some(FromRelay::Challenge { nonce, .. }) => unb64(&nonce).unwrap(),
+        Some(other) => return other,
+        None => panic!("no answer to close"),
+    };
+    let sig = sign(signer, &transcript("close", &room, &nonce, &[], 0));
+    c.send(ToRelay::Auth { sig }).await;
+    c.recv().await.expect("no answer to auth")
+}
+
+#[tokio::test]
+async fn the_invitation_alone_closes_a_full_room_and_nothing_else_does() {
+    let limits = Limits {
+        max_sessions: 1,
+        ..Limits::default()
+    };
+    let (relay, url) = start(limits).await;
+    let (mut creator, keys) = create(&url).await;
+
+    // Not a stranger, and not an attach signature replayed as a close.
+    let stranger = SigningKey::from_bytes(&random());
+    let answer = close_with(&url, keys.room, &stranger).await;
+    assert!(matches!(answer, FromRelay::Error { .. }), "got {answer:?}");
+    assert_eq!(relay.room_count(), 1);
+
+    // The room has no free seat, and closing it needs none.
+    let answer = close_with(&url, keys.room, &keys.invite_key).await;
+    assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
+    assert!(matches!(creator.recv().await, Some(FromRelay::Closed)));
+    assert_eq!(relay.room_count(), 0);
+
+    // A room that is gone, or never was, answers the same way at once.
+    let answer = close_with(&url, keys.room, &keys.invite_key).await;
+    assert!(matches!(answer, FromRelay::Closed), "got {answer:?}");
+}
+
+#[tokio::test]
+async fn the_relay_answers_pings() {
+    let (_relay, url) = start(Limits::default()).await;
+    let (mut creator, _keys) = create(&url).await;
+    creator.ws.send(Message::Ping(Default::default())).await.unwrap();
+    let answer = timeout(Duration::from_secs(5), creator.ws.next()).await;
+    assert!(matches!(answer, Ok(Some(Ok(Message::Pong(_))))), "got {answer:?}");
+}
