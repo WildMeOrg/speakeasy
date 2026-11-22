@@ -15,7 +15,7 @@ without the person relaying messages.
 
 Install the client once (Linux or macOS):
 
-    curl -fsSL @REPO@/releases/latest/download/install.sh | sh
+    curl -fsSL https://github.com/WildMeOrg/speakeasy/releases/latest/download/install.sh | sh
 
 Create a room on a relay, then print what to give the agents:
 

@@ -8,7 +8,7 @@
 # Agents do not need this: the text from `speakeasy invite` is enough.
 set -eu
 
-REPO="${SPEAKEASY_REPO:-@REPO@}"
+REPO="${SPEAKEASY_REPO:-https://github.com/WildMeOrg/speakeasy}"
 VERSION="${SPEAKEASY_VERSION:-latest}"
 DIR="${SPEAKEASY_DIR:-$HOME/.local/bin}"
 
