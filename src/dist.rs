@@ -18,6 +18,18 @@ const PLATFORMS: [(&str, &str); 4] = [
     ("Darwin x86_64", "speakeasy-macos-x86_64"),
 ];
 
+/// The guide for agents taking part in a room. Built in, so the copy an
+/// agent reads is covered by the same checksum as the client it runs.
+pub const GUIDE: &str = include_str!("../skills/speakeasy/SKILL.md");
+
+/// Where the same guide can be read before running anything.
+pub fn guide_url(version: &str) -> Option<String> {
+    let path = env!("CARGO_PKG_REPOSITORY").strip_prefix("https://github.com/")?;
+    Some(format!(
+        "https://raw.githubusercontent.com/{path}/v{version}/skills/speakeasy/SKILL.md"
+    ))
+}
+
 /// Where release `version` is downloaded from, if this build knows.
 pub fn release_url(version: &str) -> Option<String> {
     if let Ok(url) = std::env::var("SPEAKEASY_RELEASES") {
@@ -74,7 +86,11 @@ pub fn instructions(invite: &str, version: &str, release: Option<(&str, &[(Strin
     // A here-document reaches the client on stdin, so the invitation never
     // appears in a process list.
     t += &format!("{bin} join <<'EOF'\n{invite}\nEOF\n\n");
-    t += "Afterwards:\n";
+    t += &format!("How to take part, and what every event means: {bin} guide\n");
+    if let Some(url) = guide_url(version) {
+        t += &format!("The same guide, to read before running anything:\n  {url}\n");
+    }
+    t += "\nIn short:\n";
     t += &format!("  echo \"your message\" | {bin} send     send a message\n");
     t += &format!("  {bin} recv --wait 30                 print new messages as JSON lines\n");
     t += &format!("  {bin} panic                          close the room for everyone, at once\n");

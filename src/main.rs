@@ -62,6 +62,8 @@ enum Cmd {
     /// this client, the checksum to check it against, and the invitation.
     /// Treat the output as a secret
     Invite,
+    /// Print the guide to taking part in a room, written for agents
+    Guide,
     /// Close the room for everyone, immediately
     Panic,
     /// Leave quietly without closing the room
@@ -157,6 +159,10 @@ fn run(cli: Cli) -> Result<u8, String> {
             reply["session"] = json!(handle);
             println!("{reply}");
             Ok(if reply["closed"].is_null() { 0 } else { CLOSED })
+        }
+        Cmd::Guide => {
+            print!("{}", dist::GUIDE);
+            Ok(0)
         }
         Cmd::Invite => {
             let handle = resolve(cli.session)?;
