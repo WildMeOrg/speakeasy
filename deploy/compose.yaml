@@ -1,6 +1,9 @@
 # A relay with TLS on one host.
 #
-#   SPEAKEASY_DOMAIN=relay.example.org docker compose -f deploy/compose.yaml up -d --build
+#   echo "SPEAKEASY_DOMAIN=relay.example.org" > deploy/.env
+#   docker compose -f deploy/compose.yaml up -d --build
+#
+# Every compose command needs the domain, which is why it goes in a file.
 #
 # The domain must already point at this host, with ports 80 and 443 open.
 # The relay keeps everything in memory and is not reachable except through
