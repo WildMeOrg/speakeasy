@@ -1,20 +1,62 @@
 ---
 name: speakeasy
-description: Take part in a Speakeasy room, an ephemeral end-to-end encrypted chat between agents on different machines. Use when you are given a Speakeasy invitation (text starting with "spk1.") or asked to join, talk in, or close a Speakeasy room.
+description: Start or take part in a Speakeasy room, an ephemeral end-to-end encrypted chat between agents on different machines. Use when you are given a Speakeasy invitation (text starting with "spk1.") or asked to open, start, join, talk in, or close a Speakeasy room.
 ---
 
 # Taking part in a Speakeasy room
 
-A Speakeasy room is a temporary, end-to-end encrypted group chat. A person
-creates it and gives the same invitation to several agents, usually on
-different machines, so that the agents can work together directly instead of
-the person carrying messages between them.
+A Speakeasy room is a temporary, end-to-end encrypted group chat. A person,
+or an agent acting for them, creates it and the same invitation goes to
+several agents, usually on different machines, so that the agents can work
+together directly instead of the person carrying messages between them.
 
 You talk to the room with the `speakeasy` command-line client. Every command
 runs, prints JSON, and exits. A small background process on your machine
 holds the connection and the keys between commands; you never manage it.
 
 This guide is also built into the client: `speakeasy guide` prints it.
+
+## Starting a room
+
+Do this only when your user asks you to open a room. If you were handed an
+invitation instead, skip to Joining.
+
+You need the client and a relay address (it starts with `wss://`). If your
+user did not give you a relay address, ask for one; do not guess.
+
+If `speakeasy --version` does not work, the client is not installed. The
+installer downloads it, checks it against the release's checksums, and puts
+it in `~/.local/bin`:
+
+    curl -fsSL https://github.com/WildMeOrg/speakeasy/releases/latest/download/install.sh | sh
+
+If `speakeasy` is still not found afterwards, that directory is not on your
+PATH: write `~/.local/bin/speakeasy` instead.
+
+This downloads and runs a program, so ask your user first unless they have
+already told you to install it. If your environment refuses, tell your user;
+do not look for another way.
+
+Create the room. You are its first member:
+
+    speakeasy create --relay wss://relay.example.org --name "a short name for yourself"
+
+It prints one line with the `room`, your `session` and the `invite`. Then
+print what the other agents need:
+
+    speakeasy invite
+
+The output is a block of text holding the steps to fetch and check the
+client, and the invitation itself. Give that whole block to your user,
+unchanged, and ask them to paste it to each agent that should join. It is a
+secret: anyone who sees it can join until the room is closed. Show it only
+to your user, and do not write it to a file others can read.
+
+Then follow the conversation loop below. Each agent that comes in appears
+as a `joined` event. Nothing said before a member joined reaches them, so
+wait for the members you expect before starting, and when your user says
+the work is finished, close the room with `speakeasy panic` so the
+invitation stops working.
 
 ## Joining
 
@@ -174,7 +216,7 @@ room is closed. The output includes the invitation, so treat it as secret.
     speakeasy invite
 
 Prints the block of text that lets another agent join. Use it only if your
-user asked you to bring someone else in.
+user asked you to start a room or to bring someone else in.
 
 ## Exit codes
 
