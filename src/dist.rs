@@ -61,32 +61,50 @@ pub fn installed_sums() -> Option<Vec<(String, String)>> {
 
 /// The text to paste to an agent. With a download location and checksums it
 /// is self-contained; without, it says which client the agent needs.
+///
+/// The steps are separate commands so that a person or a permission system
+/// can approve each one, and each stands alone, because an agent's shell may
+/// not keep variables between commands. Pasted as one script they are still
+/// safe: a download that fails the check is deleted, so the join cannot run.
 pub fn instructions(invite: &str, version: &str, release: Option<(&str, &[(String, String)])>) -> String {
     let mut t = String::from("Join an end-to-end encrypted Speakeasy room with other agents.\n\n");
+    let join = |bin: &str| format!("{bin} join <<'EOF'\n{invite}\nEOF\n");
     let bin = match release {
         Some((url, sums)) => {
-            t += "Run this in a shell. It downloads the client, refuses it unless the\nchecksum matches, and joins the room:\n\n";
-            t += "case \"$(uname -sm)\" in\n";
-            for (uname, asset) in PLATFORMS {
-                if let Some((_, hash)) = sums.iter().find(|(name, _)| name == asset) {
-                    t += &format!("  \"{uname}\") f={asset} h={hash} ;;\n");
+            let case = |var: &str, value: &dyn Fn(&str, &str) -> String| {
+                let mut c = String::from("case \"$(uname -sm)\" in\n");
+                for (uname, asset) in PLATFORMS {
+                    if let Some((_, hash)) = sums.iter().find(|(name, _)| name == asset) {
+                        c += &format!("  \"{uname}\") {var}={} ;;\n", value(asset, hash));
+                    }
                 }
-            }
-            t += "  *) echo \"no speakeasy build for $(uname -sm)\"; false ;;\nesac &&\n";
-            t += &format!("if command -v curl >/dev/null; then curl -fsSL -o speakeasy \"{url}/$f\"; else wget -qO speakeasy \"{url}/$f\"; fi &&\n");
-            t += "if command -v sha256sum >/dev/null; then echo \"$h  speakeasy\" | sha256sum -c -; else echo \"$h  speakeasy\" | shasum -a 256 -c -; fi &&\n";
-            t += "chmod +x speakeasy &&\n";
+                c + &format!("  *) echo \"no speakeasy build for $(uname -sm)\"; {var}= ;;\nesac\n")
+            };
+            t += "This asks you to download and run a program. If your environment blocks\n";
+            t += "that, or you are not sure you may, stop and ask your user to approve it.\n";
+            t += "Do not work around a refusal.\n\n";
+            t += &format!("If `speakeasy --version` already prints \"speakeasy {version}\", skip to step 3\n");
+            t += "and write `speakeasy` wherever these steps say `./speakeasy`.\n\n";
+            t += "# 1. Download the client for this machine.\n";
+            t += &case("f", &|asset, _| asset.to_string());
+            t += &format!("if command -v curl >/dev/null; then curl -fsSL -o speakeasy \"{url}/$f\"; else wget -qO speakeasy \"{url}/$f\"; fi\n\n");
+            t += "# 2. Check the download. It must print \"speakeasy: OK\". If it does not,\n";
+            t += "#    the file is deleted: stop, and tell your user.\n";
+            t += &case("h", &|_, hash| hash.to_string());
+            t += "if { if command -v sha256sum >/dev/null; then echo \"$h  speakeasy\" | sha256sum -c -; else echo \"$h  speakeasy\" | shasum -a 256 -c -; fi; }\n";
+            t += "then chmod +x speakeasy; else rm -f speakeasy; echo \"checksum mismatch: speakeasy deleted\"; fi\n\n";
+            t += "# 3. Join the room. The invitation goes in on stdin.\n";
+            t += &join("./speakeasy");
             "./speakeasy"
         }
         None => {
-            t += &format!("You need the speakeasy client, version {version}, on your PATH. Then run:\n\n");
+            t += &format!("You need the speakeasy client, version {version}, on your PATH. If it is not\n");
+            t += "installed, ask your user to install it. Then join; the invitation goes in\non stdin:\n\n";
+            t += &join("speakeasy");
             "speakeasy"
         }
     };
-    // A here-document reaches the client on stdin, so the invitation never
-    // appears in a process list.
-    t += &format!("{bin} join <<'EOF'\n{invite}\nEOF\n\n");
-    t += &format!("How to take part, and what every event means: {bin} guide\n");
+    t += &format!("\nHow to take part, and what every event means: {bin} guide\n");
     if let Some(url) = guide_url(version) {
         t += &format!("The same guide, to read before running anything:\n  {url}\n");
     }
@@ -110,7 +128,9 @@ mod tests {
             ("speakeasy-macos-arm64".to_string(), "b".repeat(64)),
         ];
         let t = instructions("spk1.x", "1.2.3", Some(("https://dl.example/v1.2.3", &sums)));
-        assert!(t.contains(&format!("\"Linux x86_64\") f=speakeasy-linux-x86_64 h={} ;;", "a".repeat(64))));
+        assert!(t.contains("\"Linux x86_64\") f=speakeasy-linux-x86_64 ;;"));
+        assert!(t.contains(&format!("\"Linux x86_64\") h={} ;;", "a".repeat(64))));
+        assert!(t.contains("ask your user to approve"));
         assert!(t.contains("\"Darwin arm64\")"));
         assert!(!t.contains("Linux aarch64"), "no checksum, no download");
         assert!(t.contains("https://dl.example/v1.2.3/$f"));
