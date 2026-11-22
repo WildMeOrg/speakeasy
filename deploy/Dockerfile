@@ -4,6 +4,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY skills skills
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
