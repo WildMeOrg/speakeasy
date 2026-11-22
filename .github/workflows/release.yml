@@ -1,0 +1,49 @@
+# Pushing a tag like v0.1.0 builds the client for each platform and publishes
+# the binaries with a SHA256SUMS file. `speakeasy invite` pins those checksums
+# in the text a person pastes to an agent.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: speakeasy-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: speakeasy-linux-aarch64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: speakeasy-macos-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, asset: speakeasy-macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "$GITHUB_REF_NAME"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal && rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/speakeasy ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum speakeasy-* > SHA256SUMS && cat SHA256SUMS
+      - run: gh release create "$GITHUB_REF_NAME" dist/* install.sh --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

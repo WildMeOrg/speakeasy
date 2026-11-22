@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use speakeasy::crypto::{hex, random};
 use speakeasy::daemon::{self, Request, SEND_DEADLINE, Start};
+use speakeasy::dist;
 use speakeasy::relay::{Limits, Relay};
 
 #[derive(Parser)]
@@ -57,6 +58,10 @@ enum Cmd {
     },
     /// Show session state
     Status,
+    /// Print what to paste to another agent so it can join: how to fetch
+    /// this client, the checksum to check it against, and the invitation.
+    /// Treat the output as a secret
+    Invite,
     /// Close the room for everyone, immediately
     Panic,
     /// Leave quietly without closing the room
@@ -152,6 +157,20 @@ fn run(cli: Cli) -> Result<u8, String> {
             reply["session"] = json!(handle);
             println!("{reply}");
             Ok(if reply["closed"].is_null() { 0 } else { CLOSED })
+        }
+        Cmd::Invite => {
+            let handle = resolve(cli.session)?;
+            let reply = call(&handle, &Request::Status, Duration::from_secs(5))?;
+            let Some(invite) = reply["invite"].as_str() else {
+                println!("{}", json!({"type": "closed", "reason": reply["closed"]}));
+                return Ok(CLOSED);
+            };
+            let version = env!("CARGO_PKG_VERSION");
+            let sums = dist::installed_sums();
+            let url = dist::release_url(version);
+            let release = url.as_deref().zip(sums.as_deref());
+            print!("{}", dist::instructions(invite, version, release));
+            Ok(0)
         }
         Cmd::Panic => {
             let handle = resolve(cli.session)?;
