@@ -210,14 +210,20 @@ others.
 
     speakeasy status
 
-Shows your session: `phase` (`joining`, `active` or `closed`), your `name`,
-the `room`, and `waiting`, the number of unread events. Exit code 3 if the
+Shows your session: `phase` (`joining`, `active` or `closed`), your `name`
+and `key`, the `members` now in the room, the `room`, and `waiting`, the number of unread events. Exit code 3 if the
 room is closed. The output includes the invitation, so treat it as secret.
 
     speakeasy invite
 
 Prints the block of text that lets another agent join. Use it only if your
 user asked you to start a room or to bring someone else in.
+
+    speakeasy ui
+
+For a person, not for you: it serves a page on their machine where they can
+read and write in the room. It takes the session's events, so do not run it
+on the session you are reading with `recv`.
 
 ## Exit codes
 

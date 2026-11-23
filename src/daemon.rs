@@ -73,6 +73,11 @@ struct Inbox {
     panic_confirmed: Option<bool>,
     invite: Option<String>,
     room: Option<String>,
+    /// This participant's own member code, as the others see it.
+    key: Option<String>,
+    /// Who is in the room, as `{name, key}`. Events are handed out once, so
+    /// this is how a reader that starts late learns who is already there.
+    members: Vec<Value>,
     name: String,
 }
 
@@ -719,7 +724,10 @@ impl Session {
                     .collect();
                 self.phase = Phase::Active { mls };
                 self.last_commit = seq;
-                self.shared.update(|i| i.phase = "active");
+                self.shared.update(|i| {
+                    i.phase = "active";
+                    i.members = members.clone();
+                });
                 self.shared
                     .event(json!({"type": "ready", "seq": seq, "members": members}));
             }
@@ -737,9 +745,13 @@ impl Session {
                     .open(Blob::Commit, data)
                     .and_then(|commit| mls.process_join(&commit));
                 match admitted {
-                    Ok(p) => self.shared.event(json!({
-                        "type": "joined", "seq": seq, "name": p.name, "key": p.key,
-                    })),
+                    Ok(p) => {
+                        let member = json!({"name": p.name, "key": p.key});
+                        self.shared.update(|i| i.members.push(member));
+                        self.shared.event(json!({
+                            "type": "joined", "seq": seq, "name": p.name, "key": p.key,
+                        }))
+                    }
                     Err(why) => {
                         self.shared
                             .event(json!({"type": "join_rejected", "seq": seq, "reason": why}));
@@ -940,12 +952,15 @@ async fn create(
         other => return Err(format!("relay refused create: {other:?}")),
     }
     let encoded = invite.encode();
+    let my_key = me.key();
     let mut session = Session::new(shared, invite, keys, me, relay_session, 0);
     session.phase = Phase::Active { mls };
     shared.update(|i| {
         i.phase = "active";
         i.invite = Some(encoded);
         i.room = Some(room.to_string());
+        i.members = vec![json!({"name": name, "key": my_key})];
+        i.key = Some(my_key);
     });
     Ok(session)
 }
@@ -966,8 +981,12 @@ async fn join(
         Err(Fail::Gap) => return Err("relay reported a gap on attach".into()),
     };
     link.ws = Some(a.ws);
-    shared.update(|i| i.room = Some(invite.room.to_string()));
-    let mut session = Session::new(shared, invite, keys, Keys::new(name), a.relay_session, a.head);
+    let me = Keys::new(name);
+    shared.update(|i| {
+        i.room = Some(invite.room.to_string());
+        i.key = Some(me.key());
+    });
+    let mut session = Session::new(shared, invite, keys, me, a.relay_session, a.head);
     session.begin_join(&a.snapshot, 0);
     Ok(session)
 }
@@ -1138,7 +1157,8 @@ async fn serve_local(
             let i = shared.inbox.lock().unwrap();
             json!({
                 "phase": i.phase, "closed": i.closed, "room": i.room,
-                "name": i.name, "invite": i.invite, "waiting": i.events.len(),
+                "name": i.name, "key": i.key, "members": i.members,
+                "invite": i.invite, "waiting": i.events.len(),
                 "pid": std::process::id(),
             })
         }

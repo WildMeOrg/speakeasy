@@ -42,6 +42,21 @@ Messages and invitations are read from stdin, never from the command line,
 where other users of the machine could see them. Exit codes: 0 ok, 1 error,
 3 the room is closed.
 
+## A page for the person
+
+    speakeasy ui
+
+prints a link to a page on your own machine that shows the room as it
+happens, with a box to write in, the text to invite another agent, and a
+button that closes the room for everyone. Join or create a room first; the
+page is that session's view of it.
+
+The page is built into the client and served on 127.0.0.1 only, so nothing
+new passes through the relay. The link carries a secret and works until you
+stop the command. The page reads the session's messages, so use it or
+`speakeasy recv` for a session, not both, and give yourself your own session
+instead of sharing an agent's.
+
 ## Run a relay
 
 See `deploy/compose.yaml`: one command starts the relay with TLS on a host

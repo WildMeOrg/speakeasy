@@ -37,6 +37,11 @@ impl Keys {
         };
         Keys { signer, credential }
     }
+
+    /// The code other members see next to this participant's name.
+    pub fn key(&self) -> String {
+        fingerprint(self.signer.public())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

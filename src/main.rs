@@ -16,6 +16,8 @@ use speakeasy::daemon::{self, Request, SEND_DEADLINE, Start};
 use speakeasy::dist;
 use speakeasy::relay::{Limits, Relay};
 
+mod ui;
+
 #[derive(Parser)]
 #[command(version, about = "Ephemeral end-to-end encrypted rooms for agents")]
 struct Cli {
@@ -64,6 +66,13 @@ enum Cmd {
     Invite,
     /// Print the guide to taking part in a room, written for agents
     Guide,
+    /// Serve a page on this machine for a person to read and write in the
+    /// room, with a button that closes it. Prints the link to open
+    Ui {
+        /// Port on 127.0.0.1. The default picks a free one
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// Close the room for everyone, immediately
     Panic,
     /// Leave quietly without closing the room
@@ -166,18 +175,18 @@ fn run(cli: Cli) -> Result<u8, String> {
         }
         Cmd::Invite => {
             let handle = resolve(cli.session)?;
-            let reply = call(&handle, &Request::Status, Duration::from_secs(5))?;
-            let Some(invite) = reply["invite"].as_str() else {
-                println!("{}", json!({"type": "closed", "reason": reply["closed"]}));
-                return Ok(CLOSED);
-            };
-            let version = env!("CARGO_PKG_VERSION");
-            let sums = dist::installed_sums();
-            let url = dist::release_url(version);
-            let release = url.as_deref().zip(sums.as_deref());
-            print!("{}", dist::instructions(invite, version, release));
-            Ok(0)
+            match invite_text(&handle)? {
+                Ok(text) => {
+                    print!("{text}");
+                    Ok(0)
+                }
+                Err(reason) => {
+                    println!("{}", json!({"type": "closed", "reason": reason}));
+                    Ok(CLOSED)
+                }
+            }
         }
+        Cmd::Ui { port } => ui::run(resolve(cli.session)?, port),
         Cmd::Panic => {
             let handle = resolve(cli.session)?;
             let reply = call(&handle, &Request::Panic, Duration::from_secs(15))?;
@@ -190,6 +199,19 @@ fn run(cli: Cli) -> Result<u8, String> {
             Ok(0)
         }
     }
+}
+
+/// What to paste to another agent, or why the room is closed.
+fn invite_text(handle: &str) -> Result<Result<String, Value>, String> {
+    let reply = call(handle, &Request::Status, Duration::from_secs(5))?;
+    let Some(invite) = reply["invite"].as_str() else {
+        return Ok(Err(reply["closed"].clone()));
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let sums = dist::installed_sums();
+    let url = dist::release_url(version);
+    let release = url.as_deref().zip(sums.as_deref());
+    Ok(Ok(dist::instructions(invite, version, release)))
 }
 
 fn default_name() -> String {

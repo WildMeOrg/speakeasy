@@ -427,6 +427,146 @@ fn session_handles_cannot_escape_the_private_directory_and_ambiguity_is_an_error
 /// The TLS path must at least start. Nothing here can present a trusted
 /// certificate, so the connection fails, but as a reported error and not a
 /// crashed daemon.
+/// `speakeasy ui` running for one agent's session, stopped when dropped.
+struct PageServer {
+    child: std::process::Child,
+    port: u16,
+    token: String,
+}
+
+impl PageServer {
+    fn start(agent: &Agent) -> Self {
+        use std::io::{BufRead, BufReader};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_speakeasy"))
+            .arg("ui")
+            .env("XDG_RUNTIME_DIR", &agent.dir)
+            .env_remove("SPEAKEASY_SESSION")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let link = BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .map(|l| l.unwrap())
+            .find_map(|l| l.trim().strip_prefix("http://127.0.0.1:").map(str::to_string))
+            .expect("ui printed no link");
+        let (port, token) = link.split_once("/#").unwrap();
+        PageServer {
+            child,
+            port: port.parse().unwrap(),
+            token: token.to_string(),
+        }
+    }
+
+    /// One HTTP request, by hand. Returns the status, headers and body.
+    fn http(&self, method: &str, path: &str, host: Option<&str>, token: Option<&str>, body: &str) -> (u16, String, String) {
+        use std::io::Read;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        let host = host.map(str::to_string).unwrap_or(format!("127.0.0.1:{}", self.port));
+        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        write!(
+            s,
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap_or((&reply, ""));
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, head.to_lowercase(), body.to_string())
+    }
+
+    fn api(&self, method: &str, path: &str, body: &str) -> Value {
+        let (status, _, reply) = self.http(method, path, None, Some(&self.token), body);
+        assert_eq!(status, 200, "{method} {path}: {reply}");
+        serde_json::from_str(&reply).unwrap_or_else(|_| panic!("not JSON: {reply}"))
+    }
+}
+
+impl Drop for PageServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn the_page_lets_a_person_take_part_and_close_the_room_and_keeps_strangers_out() {
+    let relay = start_relay(Limits::default());
+    let (person, invite) = Agent::create(&relay, "person");
+    let agent = Agent::join(&invite, "agent");
+    let page = PageServer::start(&person);
+
+    // The page itself is not a secret, but it may run no script but its own.
+    let (status, head, body) = page.http("GET", "/", None, None, "");
+    assert_eq!(status, 200);
+    assert!(body.contains("<title>Speakeasy</title>"));
+    assert!(head.contains("content-security-policy: default-src 'none'; script-src 'nonce-"));
+    assert!(head.contains("cache-control: no-store"));
+    assert!(!body.contains("__NONCE__") && !body.contains(&page.token));
+
+    // Without the token from the link, nothing in the room can be reached.
+    for (method, path) in [
+        ("GET", "/api/events"),
+        ("GET", "/api/invite"),
+        ("POST", "/api/send"),
+        ("POST", "/api/panic"),
+        ("POST", "/api/leave"),
+    ] {
+        assert_eq!(page.http(method, path, None, None, "x").0, 401, "{path}");
+        assert_eq!(page.http(method, path, None, Some("wrong"), "x").0, 401, "{path}");
+    }
+    // Nor under any other name, which is how a website would get here by
+    // pointing its own name at this machine.
+    let elsewhere = Some("evil.example:80");
+    assert_eq!(page.http("GET", "/", elsewhere, None, "").0, 403);
+    assert_eq!(page.http("POST", "/api/panic", elsewhere, Some(&page.token), "").0, 403);
+    assert_eq!(relay.relay.room_count(), 1, "none of that closed the room");
+
+    // Both directions.
+    let sent = page.api("POST", "/api/send", "hello from the page");
+    assert_eq!(sent["ok"], true, "{sent}");
+    assert!(texts(&agent.recv_until("message")).contains(&"hello from the page"));
+    agent.send("hello from the agent");
+
+    let mut seen = Vec::new();
+    let mut next = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.iter().any(|e: &Value| e["type"] == "message") {
+        assert!(Instant::now() < deadline, "no message reached the page: {seen:?}");
+        let r = page.api("GET", &format!("/api/events?after={next}"), "");
+        assert_eq!(r["me"]["name"], "person");
+        assert_eq!(r["me"]["key"].as_str().map(str::len), Some(16), "{r}");
+        // Who is in the room comes from the session, not from events this
+        // page happened to see: the agent joined before the page started.
+        let names: Vec<&str> = r["members"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["person", "agent"], "{r}");
+        next = r["next"].as_u64().unwrap();
+        seen.extend(r["events"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(texts(&seen), ["hello from the agent"]);
+    // The person's own message is in the page's record too, and a reload
+    // (asking again from the start) gets everything back.
+    let again = page.api("GET", "/api/events?after=0", "");
+    let again = again["events"].as_array().unwrap();
+    assert_eq!(again.len(), seen.len());
+    assert!(again.iter().any(|e| e["type"] == "sent" && e["text"] == "hello from the page"));
+
+    // The invitation is offered to the person, as text to paste.
+    let offered = page.api("GET", "/api/invite", "");
+    assert!(offered["text"].as_str().unwrap().contains(&invite));
+
+    // The button that closes the room for everyone.
+    let closed = page.api("POST", "/api/panic", "");
+    assert_eq!(closed["relay_confirmed"], true, "{closed}");
+    assert_eq!(agent.recv("10").code, 3);
+    assert_eq!(relay.relay.room_count(), 0);
+    let r = page.api("GET", &format!("/api/events?after={next}"), "");
+    assert_eq!(r["events"][0]["type"], "closed", "{r}");
+}
+
 #[test]
 fn a_tls_relay_address_gets_as_far_as_a_tls_handshake() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
