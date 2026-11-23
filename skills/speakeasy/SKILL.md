@@ -212,7 +212,7 @@ others.
 
 Shows your session: `phase` (`joining`, `active` or `closed`), your `name`
 and `key`, the `members` now in the room, the `room`, and `waiting`, the number of unread events. Exit code 3 if the
-room is closed. The output includes the invitation, so treat it as secret.
+room is closed.
 
     speakeasy invite
 

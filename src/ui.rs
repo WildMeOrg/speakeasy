@@ -125,15 +125,11 @@ impl Page {
     /// started it runs to the end, whether or not anyone waits for the answer.
     async fn daemon(self: Arc<Self>, req: Request, wait: Duration) -> Value {
         let work = tokio::task::spawn_blocking(move || {
-            let text = match &req {
-                Request::Send { text } => Some(text.clone()),
-                _ => None,
-            };
             let reply = call(&self.handle, &req, wait).unwrap_or_else(|e| json!({"error": e}));
             // The daemon does not echo a member's own messages, so the page's
             // copy is recorded here, once the relay has placed it in the
             // order, even if the browser has given up on the request.
-            if let Some(text) = text.filter(|_| reply["ok"] == true) {
+            if let (Request::Send { text }, true) = (req, reply["ok"] == true) {
                 self.push(json!({"type": "sent", "seq": reply["seq"], "text": text}));
             }
             reply

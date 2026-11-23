@@ -52,6 +52,8 @@ pub enum Start {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    /// The invitation. Asked for on its own, so that `status` is not secret.
+    Invite,
     Send { text: String },
     Recv { wait: f64 },
     Panic,
@@ -950,15 +952,15 @@ async fn create(
         other => return Err(format!("relay refused create: {other:?}")),
     }
     let encoded = invite.encode();
-    let my_key = me.key();
+    let (my_key, members) = (me.key(), mls.members());
     let mut session = Session::new(shared, invite, keys, me, relay_session, 0);
     session.phase = Phase::Active { mls };
     shared.update(|i| {
         i.phase = "active";
         i.invite = Some(encoded);
         i.room = Some(room.to_string());
-        i.key = Some(my_key.clone());
-        i.members = vec![Peer { name: name.to_string(), key: my_key }];
+        i.key = Some(my_key);
+        i.members = members;
     });
     Ok(session)
 }
@@ -1161,9 +1163,13 @@ async fn serve_local(
             json!({
                 "phase": i.phase, "closed": i.closed, "room": i.room,
                 "name": i.name, "key": i.key, "members": i.members,
-                "invite": i.invite, "waiting": i.events.len(),
+                "waiting": i.events.len(),
                 "pid": std::process::id(),
             })
+        }
+        Ok(Request::Invite) => {
+            let i = shared.inbox.lock().unwrap();
+            json!({"invite": i.invite, "closed": i.closed})
         }
         Ok(Request::Recv { wait }) => {
             return serve_recv(wait, &shared, &mut lines, &mut write).await;

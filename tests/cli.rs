@@ -117,7 +117,9 @@ impl Agent {
         let out = a.run_with(&["join", "--name", name], Some(invite));
         assert_eq!(out.code, 0, "{:?}", out.lines);
         // The secret went in on stdin and must not come back out.
-        assert!(!format!("{:?}", out.lines).contains(invite), "{:?}", out.lines);
+        assert!(!format!("{:?}", out.lines).contains(invite), "join printed the invitation");
+        // Nor is it in what `status` shows.
+        assert!(!format!("{:?}", a.run(&["status"]).lines).contains("spk1."), "status printed the invitation");
         a
     }
 
@@ -442,15 +444,13 @@ fn session_handles_cannot_escape_the_private_directory_and_ambiguity_is_an_error
 /// `speakeasy ui` running for one agent's session, stopped when dropped.
 struct PageServer {
     child: std::process::Child,
-    /// Held open so the rest of what `ui` prints has somewhere to go.
-    _stdout: std::io::BufReader<std::process::ChildStdout>,
     port: u16,
     token: String,
 }
 
 impl PageServer {
     fn start(agent: &Agent) -> Self {
-        use std::io::{BufRead, BufReader, Read};
+        use std::io::{BufRead, BufReader};
         let mut child = agent
             .command()
             .arg("ui")
@@ -458,9 +458,9 @@ impl PageServer {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let link = stdout
-            .by_ref()
+        // Borrowed, not taken: the child keeps its end, so the rest of what
+        // `ui` prints has somewhere to go.
+        let link = BufReader::new(child.stdout.as_mut().unwrap())
             .lines()
             .map(|l| l.unwrap())
             .find_map(|l| l.trim().strip_prefix("http://127.0.0.1:").map(str::to_string))
@@ -468,7 +468,6 @@ impl PageServer {
         let (port, token) = link.split_once("/#").unwrap();
         PageServer {
             child,
-            _stdout: stdout,
             port: port.parse().unwrap(),
             token: token.to_string(),
         }

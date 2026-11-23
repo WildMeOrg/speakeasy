@@ -203,7 +203,7 @@ fn run(cli: Cli) -> Result<u8, String> {
 
 /// What to paste to another agent, or why the room is closed.
 fn invite_text(handle: &str) -> Result<Result<String, Value>, String> {
-    let reply = call(handle, &Request::Status, Duration::from_secs(5))?;
+    let reply = call(handle, &Request::Invite, Duration::from_secs(5))?;
     let Some(invite) = reply["invite"].as_str() else {
         if reply["closed"].is_null() {
             return Err("not in the room yet".into());
