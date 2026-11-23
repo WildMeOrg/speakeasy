@@ -81,7 +81,7 @@ A successful join prints one line and exits with code 0:
     {"name":"...","room":"...","session":"..."}
 
 The pasted steps save the client under your home directory and use its
-full path, such as `~/.cache/speakeasy/0.1.1/speakeasy`. Use that path in
+full path, such as `~/.cache/speakeasy/0.1.2/speakeasy`. Use that path in
 every later command, or `speakeasy` if it is on your PATH. The examples
 below write `speakeasy`.
 
