@@ -16,7 +16,7 @@
 //! reloaded, and is gone when the process stops.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, Request as HttpRequest, State};
@@ -28,15 +28,21 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use speakeasy::crypto::{hex, random};
-use speakeasy::daemon::{Request, SEND_DEADLINE};
+use speakeasy::daemon::Request;
+use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
-use crate::{CLOSED, NO_SESSION, call, connect, exchange, invite_text};
+use crate::{CLOSED, NO_SESSION, SEND_WAIT, call, invite_text, recv_batch};
 
 /// How long a request for events is held open when there are none.
 const HOLD: Duration = Duration::from_secs(25);
-/// Events kept for a page that reloads. Older ones are forgotten.
+/// What is kept for a page that reloads: this many events and this much
+/// message text, whichever is reached first. Older ones are forgotten, so a
+/// talkative member cannot grow this process without limit.
 const KEEP: usize = 5000;
+const KEEP_BYTES: usize = 8 << 20;
+/// Most events in one answer to the page.
+const BATCH: usize = 500;
 /// Longest message the page may submit, in bytes.
 const MAX_TEXT: usize = 64 * 1024;
 
@@ -45,15 +51,11 @@ struct Page {
     token: String,
     html: String,
     csp: HeaderValue,
-    /// The two names this server answers to.
-    hosts: [String; 2],
+    /// The names this server answers to.
+    hosts: Vec<String>,
     me: Value,
-    /// Who is in the room, from the daemon, which knows even when this
-    /// process started after they joined.
-    members: Mutex<Value>,
-    log: Mutex<Log>,
-    /// The number of the next event; wakes held requests.
-    count: watch::Sender<u64>,
+    /// Everything the page shows. Watched, so held requests wake on change.
+    log: watch::Sender<Log>,
 }
 
 #[derive(Default)]
@@ -61,21 +63,57 @@ struct Log {
     /// The number of the oldest event still held.
     first: u64,
     events: VecDeque<Value>,
+    bytes: usize,
+    /// Who is in the room, as the daemon last reported it.
+    members: Value,
+    /// The daemon's number for the newest event taken from it.
+    taken: u64,
+}
+
+impl Log {
+    fn next(&self) -> u64 {
+        self.first + self.events.len() as u64
+    }
+
+    fn weight(event: &Value) -> usize {
+        event["text"].as_str().map_or(0, str::len) + 200
+    }
+
+    fn push(&mut self, event: Value) {
+        self.bytes += Self::weight(&event);
+        self.events.push_back(event);
+        while self.events.len() > KEEP || self.bytes > KEEP_BYTES {
+            let Some(old) = self.events.pop_front() else { break };
+            self.bytes -= Self::weight(&old);
+            self.first += 1;
+        }
+    }
+
+    /// Take one batch from the daemon. Its events are numbered, ending at
+    /// `last`, so a batch handed over twice (because the acknowledgement
+    /// went missing) adds nothing the second time.
+    fn take(&mut self, reply: &Value) {
+        self.members = reply["members"].clone();
+        let events = reply["events"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let last = reply["last"].as_u64().unwrap_or(self.taken);
+        for (i, e) in events.iter().enumerate() {
+            let number = last.saturating_sub((events.len() - 1 - i) as u64);
+            // The notice of dropped events is not one of the numbered ones.
+            if number > self.taken || e["type"] == "overflow" {
+                self.push(e.clone());
+            }
+        }
+        self.taken = last;
+    }
 }
 
 impl Page {
     fn push(&self, event: Value) {
-        let mut log = self.log.lock().unwrap();
-        log.events.push_back(event);
-        if log.events.len() > KEEP {
-            log.events.pop_front();
-            log.first += 1;
-        }
-        self.count.send_replace(log.first + log.events.len() as u64);
+        self.log.send_modify(|log| log.push(event));
     }
 
     /// One request to the session's daemon, off the async threads.
-    async fn daemon(self: &Arc<Self>, req: Request, wait: Duration) -> Value {
+    async fn daemon(&self, req: Request, wait: Duration) -> Value {
         let handle = self.handle.clone();
         tokio::task::spawn_blocking(move || call(&handle, &req, wait))
             .await
@@ -85,32 +123,19 @@ impl Page {
 }
 
 /// Move the session's events into the page's log until the room is over.
-/// This is the same read-then-acknowledge exchange `speakeasy recv` makes.
 fn follow(page: &Page) {
     let reason = loop {
-        let stream = match connect(&page.handle, HOLD + Duration::from_secs(20)) {
-            Ok(s) => s,
+        let batch = recv_batch(&page.handle, HOLD.as_secs_f64(), |reply| {
+            page.log.send_modify(|log| log.take(reply));
+            Ok(())
+        });
+        match batch {
             Err(e) => break e,
-        };
-        let wait = HOLD.as_secs_f64();
-        let reply = match exchange(&stream, &Request::Recv { wait }) {
-            Ok(r) => r,
-            Err(e) => break e,
-        };
-        let events = reply["events"].as_array().map(Vec::as_slice).unwrap_or_default();
-        // Before the events, so a page woken by them is told the new list.
-        if !events.is_empty()
-            && let Ok(status) = call(&page.handle, &Request::Status, Duration::from_secs(5))
-        {
-            *page.members.lock().unwrap() = status["members"].clone();
-        }
-        for e in events {
-            page.push(e.clone());
-        }
-        use std::io::Write;
-        let _ = (&stream).write_all(b"ack\n");
-        if let Some(reason) = reply["closed"].as_str() {
-            break reason.to_string();
+            Ok(reply) => {
+                if let Some(reason) = reply["closed"].as_str() {
+                    break reason.to_string();
+                }
+            }
         }
     };
     page.push(json!({"type": "closed", "reason": reason}));
@@ -133,21 +158,29 @@ pub fn run(handle: String, port: u16) -> Result<u8, String> {
             "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
              connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
         );
+        let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+        if port == 80 {
+            // Browsers leave the default port out.
+            hosts.extend(["127.0.0.1".to_string(), "localhost".to_string()]);
+        }
         let page = Arc::new(Page {
             handle,
             token: hex(&random::<32>()),
             html: include_str!("ui.html").replace("__NONCE__", &nonce),
             csp: HeaderValue::from_str(&csp).unwrap(),
-            hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
+            hosts,
             me: json!({"name": status["name"], "key": status["key"], "room": status["room"]}),
-            members: Mutex::new(status["members"].clone()),
-            log: Mutex::default(),
-            count: watch::channel(0).0,
+            log: watch::channel(Log {
+                members: status["members"].clone(),
+                ..Log::default()
+            })
+            .0,
         });
         println!("Speakeasy page for room {}:\n", status["room"].as_str().unwrap_or("?"));
         println!("  http://127.0.0.1:{port}/#{}\n", page.token);
         println!("Open it in a browser on this machine. The link is a secret while this");
-        println!("command runs. Ctrl-C stops the page; it does not leave the room.");
+        println!("command runs, so do not run it where others can see the output.");
+        println!("Ctrl-C stops the page; it does not leave the room.");
 
         let follower = page.clone();
         std::thread::spawn(move || follow(&follower));
@@ -171,11 +204,6 @@ fn router(page: Arc<Page>) -> Router {
         .with_state(page)
 }
 
-/// Compare without stopping at the first difference.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
-}
-
 /// Refuse anything not addressed to this machine by name, and any `/api`
 /// call without the token. Runs before every handler.
 async fn guard(State(page): State<Arc<Page>>, req: HttpRequest, next: Next) -> Response {
@@ -185,7 +213,7 @@ async fn guard(State(page): State<Arc<Page>>, req: HttpRequest, next: Next) -> R
             header(header::HOST).is_some_and(|h| page.hosts.iter().any(|ours| ours == h)),
             header(header::AUTHORIZATION)
                 .and_then(|a| a.strip_prefix("Bearer "))
-                .is_some_and(|t| same(t.as_bytes(), page.token.as_bytes())),
+                .is_some_and(|t| t.as_bytes().ct_eq(page.token.as_bytes()).into()),
         )
     };
     if !host_ok {
@@ -211,32 +239,49 @@ async fn index(State(page): State<Arc<Page>>) -> Html<String> {
 struct After {
     #[serde(default)]
     after: u64,
+    /// Answer at once, even with nothing new: a page that has just loaded
+    /// needs to know who it is and who is in the room.
+    #[serde(default)]
+    now: bool,
 }
 
 /// Events numbered `after` and up. Held open for a while if there are none.
 async fn events(State(page): State<Arc<Page>>, Query(q): Query<After>) -> Json<Value> {
-    let mut count = page.count.subscribe();
-    let _ = tokio::time::timeout(HOLD, count.wait_for(|n| *n > q.after)).await;
-    let log = page.log.lock().unwrap();
-    let skip = q.after.saturating_sub(log.first) as usize;
-    let events: Vec<&Value> = log.events.iter().skip(skip).collect();
+    let mut log = page.log.subscribe();
+    if !q.now {
+        let _ = tokio::time::timeout(HOLD, log.wait_for(|log| log.next() > q.after)).await;
+    }
+    let log = log.borrow();
+    // `first` tells a page that fell behind how much it can no longer get.
+    let from = q.after.clamp(log.first, log.next());
+    let events: Vec<&Value> = log
+        .events
+        .iter()
+        .skip((from - log.first) as usize)
+        .take(BATCH)
+        .collect();
     Json(json!({
         "me": page.me,
-        "members": *page.members.lock().unwrap(),
+        "members": log.members,
+        "first": from,
+        "next": from + events.len() as u64,
         "events": events,
-        "next": log.first + log.events.len() as u64,
     }))
 }
 
 async fn send(State(page): State<Arc<Page>>, text: String) -> Json<Value> {
-    let wait = SEND_DEADLINE + Duration::from_secs(15);
-    let reply = page.daemon(Request::Send { text: text.clone() }, wait).await;
-    // The daemon does not echo a member's own messages, so the page's copy
-    // is recorded here, once the relay has given it a place in the order.
-    if reply["ok"] == true {
-        page.push(json!({"type": "sent", "seq": reply["seq"], "text": text}));
-    }
-    Json(reply)
+    // In a task of its own: if the browser gives up on this request, the
+    // message may still go out, and the page's record of it must be kept.
+    let sent = tokio::spawn(async move {
+        let reply = page.daemon(Request::Send { text: text.clone() }, SEND_WAIT).await;
+        // The daemon does not echo a member's own messages, so the page's
+        // copy is recorded here, once the relay has placed it in the order.
+        if reply["ok"] == true {
+            page.push(json!({"type": "sent", "seq": reply["seq"], "text": text}));
+        }
+        reply
+    });
+    Json(sent.await.unwrap_or_else(|e| json!({"error": e.to_string(), "delivered": "unknown"})))
 }
 
 async fn invite(State(page): State<Arc<Page>>) -> Json<Value> {

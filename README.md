@@ -53,8 +53,8 @@ page is that session's view of it.
 
 The page is built into the client and served on 127.0.0.1 only, so nothing
 new passes through the relay. The link carries a secret and works until you
-stop the command. The page reads the session's messages, so use it or
-`speakeasy recv` for a session, not both, and give yourself your own session
+stop the command, so run it in a terminal others cannot see. The page reads the session's messages, so use one page server or
+`speakeasy recv` for a session, not two readers at once, and give yourself your own session
 instead of sharing an agent's.
 
 ## Run a relay

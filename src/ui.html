@@ -114,7 +114,19 @@ dialog pre {
 <script nonce="__NONCE__">
 "use strict";
 const $ = (id) => document.getElementById(id);
-const token = location.hash.slice(1);
+// The secret arrives after the `#`. It is moved out of the address bar, so it
+// is not left in the browser's history, and kept for this tab only, so a
+// reload still works.
+function takeToken() {
+  let t = location.hash.slice(1);
+  try {
+    if (t) sessionStorage.setItem("token", t);
+    else t = sessionStorage.getItem("token") || "";
+  } catch (err) { /* storage is off: the link works until the page reloads */ }
+  if (location.hash) history.replaceState(null, "", location.pathname);
+  return t;
+}
+const token = takeToken();
 let next = 0, over = false, me = null, members = [];
 
 async function api(method, path, body) {
@@ -143,13 +155,20 @@ function place(node, seq) {
   let before = null;
   if (seq !== undefined) {
     node.dataset.seq = seq;
-    for (let c = log.lastElementChild; c && Number(c.dataset.seq) > seq; c = c.previousElementSibling) before = c;
+    // Back past everything later in the order, and past notes with no place
+    // in it, to the newest thing that comes before this.
+    for (let c = log.lastElementChild; c; c = c.previousElementSibling) {
+      if (c.dataset.seq === undefined) continue;
+      if (Number(c.dataset.seq) <= seq) break;
+      before = c;
+    }
   }
   log.insertBefore(node, before);
+  while (log.childElementCount > 3000) log.firstElementChild.remove();
   if (atEnd) scroll.scrollTop = scroll.scrollHeight;
 }
 
-function note(text, bad) { place(el("div", bad ? "note bad" : "note", text)); }
+function note(text, bad, seq) { place(el("div", bad ? "note bad" : "note", text), seq); }
 
 function message(who, key, text, mine, seq) {
   const m = el("div", mine ? "msg mine" : "msg");
@@ -180,9 +199,9 @@ const reasons = {
 function show(e) {
   switch (e.type) {
     case "ready":
-      note("You are in the room. You only see what is said from now on.");
+      note("You are in the room. You only see what is said from now on.", false, e.seq);
       break;
-    case "joined": note(e.name + " joined."); break;
+    case "joined": note(e.name + " joined.", false, e.seq); break;
     case "message": message(e.from, e.key, e.text, false, e.seq); break;
     case "sent": message(me.name + " (you)", "", e.text, true, e.seq); break;
     case "gap": note("You were disconnected for too long and missed some messages.", true); break;
@@ -208,21 +227,21 @@ async function follow() {
   if (!token) return finish("This link is incomplete. Run `speakeasy ui` again and open the link it prints.");
   while (!over) {
     try {
-      const r = await api("GET", "/api/events?after=" + next);
+      const r = await api("GET", "/api/events?after=" + next + (me ? "" : "&now=true"));
       if (!me) {
         me = r.me;
         $("state").textContent = "You are " + me.name + " in room " + me.room;
-        document.title = "Speakeasy: " + me.name;
       }
       members = r.members || [];
       showMembers();
+      if (r.first > next) note("Older messages are no longer held by `speakeasy ui` and are not shown.", true);
       r.events.forEach(show);
       next = r.next;
     } catch (err) {
+      // No retrying: once `speakeasy ui` has stopped, something else on this
+      // machine could take over its address, and must not be sent anything.
       if (err.message === "denied") return finish("This link no longer works. Run `speakeasy ui` again and open the link it prints.");
-      $("state").textContent = "The page lost its connection to `speakeasy ui`. Retrying…";
-      await new Promise((ok) => setTimeout(ok, 2000));
-      if (me) $("state").textContent = "You are " + me.name + " in room " + me.room;
+      return finish("The page lost its connection to `speakeasy ui`. You may still be in the room. Run `speakeasy ui` again and open the link it prints.");
     }
   }
 }
@@ -238,7 +257,7 @@ $("form").addEventListener("submit", async (ev) => {
     else if (r.delivered === "unknown") note("That message may or may not have reached the room. Ask before sending it again.", true);
     else if (r.error !== "closed") note("Not sent: " + (r.error || "unknown error"), true);
   } catch (err) {
-    note("Not sent: " + err.message, true);
+    note("That message may or may not have reached the room (" + err.message + "). Ask before sending it again.", true);
   }
   if (!over) { $("send").disabled = box.disabled = false; box.focus(); }
 });

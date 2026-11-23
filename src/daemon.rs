@@ -717,11 +717,7 @@ impl Session {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Joining { mls, commit_id, .. } if commit_id == id => {
                 // Exactly our commit was sequenced: the provisional group is real.
-                let members: Vec<Value> = mls
-                    .members()
-                    .into_iter()
-                    .map(|p| json!({"name": p.name, "key": p.key}))
-                    .collect();
+                let members = roster(&mls);
                 self.phase = Phase::Active { mls };
                 self.last_commit = seq;
                 self.shared.update(|i| {
@@ -746,8 +742,10 @@ impl Session {
                     .and_then(|commit| mls.process_join(&commit));
                 match admitted {
                     Ok(p) => {
-                        let member = json!({"name": p.name, "key": p.key});
-                        self.shared.update(|i| i.members.push(member));
+                        // Taken afresh, not appended to: a member that
+                        // rejoins replaces its old self.
+                        let members = roster(&mls);
+                        self.shared.update(|i| i.members = members);
                         self.shared.event(json!({
                             "type": "joined", "seq": seq, "name": p.name, "key": p.key,
                         }))
@@ -982,9 +980,12 @@ async fn join(
     };
     link.ws = Some(a.ws);
     let me = Keys::new(name);
+    let encoded = invite.encode();
     shared.update(|i| {
         i.room = Some(invite.room.to_string());
         i.key = Some(me.key());
+        // A member may pass the invitation on, exactly as the creator may.
+        i.invite = Some(encoded);
     });
     let mut session = Session::new(shared, invite, keys, me, a.relay_session, a.head);
     session.begin_join(&a.snapshot, 0);
@@ -1084,6 +1085,14 @@ pub fn socket_path(handle: &str) -> Result<PathBuf, String> {
 /// Hand a reader whatever is waiting. Events are removed only after the
 /// reader acknowledges them, so a reader that dies mid-read loses nothing
 /// (the next one may see those events again).
+/// Who is in the group, as readers are shown it.
+fn roster(mls: &Mls) -> Vec<Value> {
+    mls.members()
+        .into_iter()
+        .map(|p| json!({"name": p.name, "key": p.key}))
+        .collect()
+}
+
 async fn serve_recv(
     wait: f64,
     shared: &Shared,
@@ -1102,11 +1111,11 @@ async fn serve_recv(
             continue;
         }
         let _turn = shared.delivering.lock().await;
-        let (events, last, dropped, closed) = {
+        let (events, last, dropped, closed, members) = {
             let i = shared.inbox.lock().unwrap();
             let events: Vec<Value> = i.events.iter().map(|(_, e)| e.clone()).collect();
             let last = i.events.back().map(|(n, _)| *n);
-            (events, last, i.dropped, i.closed.clone())
+            (events, last, i.dropped, i.closed.clone(), i.members.clone())
         };
         if events.is_empty() && dropped == 0 && closed.is_none() && Instant::now() < deadline {
             continue; // another reader took them first
@@ -1115,7 +1124,9 @@ async fn serve_recv(
         if dropped > 0 {
             out.insert(0, json!({"type": "overflow", "dropped": dropped}));
         }
-        let reply = json!({"events": out, "closed": closed});
+        // `last` numbers the newest event, so a reader whose acknowledgement
+        // went missing can tell a batch it has already taken.
+        let reply = json!({"events": out, "closed": closed, "last": last, "members": members});
         // Both steps are bounded: a stalled reader must not hold up the
         // others for long. If it is too slow, its batch is simply delivered
         // again to the next reader.

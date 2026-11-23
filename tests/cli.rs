@@ -329,6 +329,10 @@ fn a_member_that_missed_too_much_reports_a_gap_and_rejoins() {
     assert_eq!(ready["members"].as_array().unwrap().len(), 2, "old leaf replaced");
 
     alice.recv_until("joined");
+    // Alice, who only watched, still counts two members: Bob's return
+    // replaced his old self instead of adding a second Bob.
+    let status = alice.run(&["status"]);
+    assert_eq!(status.lines[0]["members"].as_array().unwrap().len(), 2, "{:?}", status.lines);
     alice.send("welcome back");
     assert_eq!(texts(&bob.recv_until("message")), ["welcome back"]);
     bob.send("thanks");
@@ -499,6 +503,14 @@ fn the_page_lets_a_person_take_part_and_close_the_room_and_keeps_strangers_out()
     let agent = Agent::join(&invite, "agent");
     let page = PageServer::start(&person);
 
+    // A page that has just loaded is told at once who it is and who is
+    // here, without waiting for something to be said.
+    let started = Instant::now();
+    let first = page.api("GET", "/api/events?now=true", "");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(first["me"]["name"], "person");
+    assert_eq!(first["members"].as_array().unwrap().len(), 2, "{first}");
+
     // The page itself is not a secret, but it may run no script but its own.
     let (status, head, body) = page.http("GET", "/", None, None, "");
     assert_eq!(status, 200);
@@ -554,9 +566,17 @@ fn the_page_lets_a_person_take_part_and_close_the_room_and_keeps_strangers_out()
     assert_eq!(again.len(), seen.len());
     assert!(again.iter().any(|e| e["type"] == "sent" && e["text"] == "hello from the page"));
 
-    // The invitation is offered to the person, as text to paste.
+    // The invitation is offered to the person, as text to paste. A member
+    // who joined can pass it on just as the creator can.
     let offered = page.api("GET", "/api/invite", "");
     assert!(offered["text"].as_str().unwrap().contains(&invite));
+    let out = Command::new(env!("CARGO_BIN_EXE_speakeasy"))
+        .arg("invite")
+        .env("XDG_RUNTIME_DIR", &agent.dir)
+        .env_remove("SPEAKEASY_SESSION")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&invite));
 
     // The button that closes the room for everyone.
     let closed = page.api("POST", "/api/panic", "");

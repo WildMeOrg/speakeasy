@@ -87,6 +87,8 @@ enum Cmd {
 }
 
 const CLOSED: u8 = 3;
+/// How long to wait on the daemon for a send: its own deadline and a margin.
+const SEND_WAIT: Duration = Duration::from_secs(SEND_DEADLINE.as_secs() + 15);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -141,9 +143,7 @@ fn run(cli: Cli) -> Result<u8, String> {
             }
             let text = stdin_text()?;
             let handle = resolve(cli.session)?;
-            // The daemon answers within its own deadline; allow a margin.
-            let wait = SEND_DEADLINE + Duration::from_secs(15);
-            let reply = call(&handle, &Request::Send { text }, wait)?;
+            let reply = call(&handle, &Request::Send { text }, SEND_WAIT)?;
             println!("{reply}");
             Ok(match reply["error"].as_str() {
                 None => 0,
@@ -205,6 +205,9 @@ fn run(cli: Cli) -> Result<u8, String> {
 fn invite_text(handle: &str) -> Result<Result<String, Value>, String> {
     let reply = call(handle, &Request::Status, Duration::from_secs(5))?;
     let Some(invite) = reply["invite"].as_str() else {
+        if reply["closed"].is_null() {
+            return Err("not in the room yet".into());
+        }
         return Ok(Err(reply["closed"].clone()));
     };
     let version = env!("CARGO_PKG_VERSION");
@@ -263,21 +266,33 @@ fn call(handle: &str, req: &Request, wait: Duration) -> Result<Value, String> {
     exchange(&connect(handle, wait)?, req)
 }
 
-/// Print waiting events, then acknowledge them. The daemon only forgets
-/// events once acknowledged, so dying before this point loses nothing.
+/// Take waiting events, then acknowledge them. The daemon only forgets
+/// events once acknowledged, so dying before `take` is done loses nothing.
+fn recv_batch(
+    handle: &str,
+    wait: f64,
+    take: impl FnOnce(&Value) -> Result<(), String>,
+) -> Result<Value, String> {
+    let stream = connect(handle, Duration::from_secs_f64(wait + 20.0))?;
+    let reply = exchange(&stream, &Request::Recv { wait })?;
+    take(&reply)?;
+    let _ = (&stream).write_all(b"ack\n");
+    Ok(reply)
+}
+
 fn recv(handle: &str, wait: f64) -> Result<u8, String> {
-    let stream = match connect(handle, Duration::from_secs_f64(wait + 20.0)) {
-        Ok(s) => s,
+    let mut out = std::io::stdout().lock();
+    let printed = recv_batch(handle, wait, |reply| {
+        for e in reply["events"].as_array().into_iter().flatten() {
+            writeln!(out, "{e}").map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())
+    });
+    let reply = match printed {
+        Ok(reply) => reply,
         Err(e) if e == NO_SESSION => return Ok(no_session()),
         Err(e) => return Err(e),
     };
-    let reply = exchange(&stream, &Request::Recv { wait })?;
-    let mut out = std::io::stdout().lock();
-    for e in reply["events"].as_array().into_iter().flatten() {
-        writeln!(out, "{e}").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
-    let _ = (&stream).write_all(b"ack\n");
     if let Some(reason) = reply["closed"].as_str() {
         writeln!(out, "{}", json!({"type": "closed", "reason": reason})).ok();
         return Ok(CLOSED);
