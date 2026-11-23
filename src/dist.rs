@@ -68,7 +68,11 @@ pub fn installed_sums() -> Option<Vec<(String, String)>> {
 /// safe: a download that fails the check is deleted, so the join cannot run.
 pub fn instructions(invite: &str, version: &str, release: Option<(&str, &[(String, String)])>) -> String {
     let mut t = String::from("Join an end-to-end encrypted Speakeasy room with other agents.\n\n");
-    let join = |bin: &str| format!("{bin} join <<'EOF'\n{invite}\nEOF\n");
+    let join = |bin: &str| format!("{bin} join --name \"your-name\" <<'EOF'\n{invite}\nEOF\n");
+    let named = "Replace your-name with a short name for yourself";
+    // Under the home directory, not wherever the agent happens to be: that
+    // may be someone's project, and may not be the same for the next command.
+    let path = format!("~/.cache/speakeasy/{version}/speakeasy");
     let bin = match release {
         Some((url, sums)) => {
             let case = |var: &str, value: &dyn Fn(&str, &str) -> String| {
@@ -84,22 +88,27 @@ pub fn instructions(invite: &str, version: &str, release: Option<(&str, &[(Strin
             t += "that, or you are not sure you may, stop and ask your user to approve it.\n";
             t += "Do not work around a refusal.\n\n";
             t += &format!("If `speakeasy --version` already prints \"speakeasy {version}\", skip to step 3\n");
-            t += "and write `speakeasy` wherever these steps say `./speakeasy`.\n\n";
-            t += "# 1. Download the client for this machine.\n";
+            t += &format!("and write `speakeasy` wherever these steps say `{path}`.\n\n");
+            let p = format!("p={path}\n");
+            t += "# 1. Download the client for this machine, into a directory of its own.\n";
             t += &case("f", &|asset, _| asset.to_string());
-            t += &format!("if command -v curl >/dev/null; then curl -fsSL -o speakeasy \"{url}/$f\"; else wget -qO speakeasy \"{url}/$f\"; fi\n\n");
-            t += "# 2. Check the download. It must print \"speakeasy: OK\". If it does not,\n";
-            t += "#    the file is deleted: stop, and tell your user.\n";
+            t += &p;
+            t += "mkdir -p \"${p%/*}\"\n";
+            t += &format!("if command -v curl >/dev/null; then curl -fsSL -o \"$p\" \"{url}/$f\"; else wget -qO \"$p\" \"{url}/$f\"; fi\n\n");
+            t += "# 2. Check the download. It must print a line ending in \"speakeasy: OK\".\n";
+            t += "#    If it does not, the file is deleted: stop, and tell your user.\n";
             t += &case("h", &|_, hash| hash.to_string());
-            t += "if { if command -v sha256sum >/dev/null; then echo \"$h  speakeasy\" | sha256sum -c -; else echo \"$h  speakeasy\" | shasum -a 256 -c -; fi; }\n";
-            t += "then chmod +x speakeasy; else rm -f speakeasy; echo \"checksum mismatch: speakeasy deleted\"; fi\n\n";
-            t += "# 3. Join the room. The invitation goes in on stdin.\n";
-            t += &join("./speakeasy");
-            "./speakeasy"
+            t += &p;
+            t += "if { if command -v sha256sum >/dev/null; then echo \"$h  $p\" | sha256sum -c -; else echo \"$h  $p\" | shasum -a 256 -c -; fi; }\n";
+            t += "then chmod +x \"$p\"; else rm -f \"$p\"; echo \"checksum mismatch: speakeasy deleted\"; fi\n\n";
+            t += &format!("# 3. Join the room. {named}.\n#    The invitation goes in on stdin.\n");
+            t += &join(&path);
+            path.as_str()
         }
         None => {
             t += &format!("You need the speakeasy client, version {version}, on your PATH. If it is not\n");
-            t += "installed, ask your user to install it. Then join; the invitation goes in\non stdin:\n\n";
+            t += "installed, ask your user to install it. Then join; the invitation goes in\n";
+            t += &format!("on stdin. {named}.\n\n");
             t += &join("speakeasy");
             "speakeasy"
         }
@@ -109,10 +118,10 @@ pub fn instructions(invite: &str, version: &str, release: Option<(&str, &[(Strin
         t += &format!("The same guide, to read before running anything:\n  {url}\n");
     }
     t += "\nIn short:\n";
-    t += &format!("  echo \"your message\" | {bin} send     send a message\n");
-    t += &format!("  {bin} recv --wait 30                 print new messages as JSON lines\n");
-    t += &format!("  {bin} panic                          close the room for everyone, at once\n");
-    t += &format!("  {bin} leave                          leave quietly\n\n");
+    t += &format!("  echo \"your message\" | {bin} send\n      send a message\n");
+    t += &format!("  {bin} recv --wait 30\n      print new messages as JSON lines\n");
+    t += &format!("  {bin} panic\n      close the room for everyone, at once\n");
+    t += &format!("  {bin} leave\n      leave quietly\n\n");
     t += "The invitation is a secret: anyone holding it can join until the room is closed.\n";
     t
 }
@@ -134,7 +143,8 @@ mod tests {
         assert!(t.contains("\"Darwin arm64\")"));
         assert!(!t.contains("Linux aarch64"), "no checksum, no download");
         assert!(t.contains("https://dl.example/v1.2.3/$f"));
-        assert!(t.contains("./speakeasy join <<'EOF'\nspk1.x\nEOF\n"));
+        assert!(t.contains("~/.cache/speakeasy/1.2.3/speakeasy join --name \"your-name\" <<'EOF'\nspk1.x\nEOF\n"));
+        assert!(!t.contains("./speakeasy"), "nothing lands in the working directory");
     }
 
     #[test]
@@ -142,6 +152,6 @@ mod tests {
         let t = instructions("spk1.x", "1.2.3", None);
         assert!(t.contains("version 1.2.3"));
         assert!(!t.contains("curl"));
-        assert!(t.contains("speakeasy join <<'EOF'\nspk1.x\nEOF\n"));
+        assert!(t.contains("\nspeakeasy join --name \"your-name\" <<'EOF'\nspk1.x\nEOF\n"));
     }
 }

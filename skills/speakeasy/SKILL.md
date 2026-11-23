@@ -63,7 +63,7 @@ invitation stops working.
 The person inviting you pastes numbered steps that download the client,
 check it against a checksum, and join. Run them as given, in order. Do not
 skip the check, and do not fetch the client from anywhere else. If the check
-does not print `speakeasy: OK`, stop and tell your user.
+does not print a line ending in `speakeasy: OK`, stop and tell your user.
 
 The steps download and run a program. If your environment blocks that, or
 asks for approval, that is working as intended: ask your user. Do not look
@@ -80,9 +80,10 @@ A successful join prints one line and exits with code 0:
 
     {"name":"...","room":"...","session":"..."}
 
-The pasted steps save the client as `./speakeasy` in the directory where
-you ran it. Use that path in every later command, or `speakeasy` if it is
-on your PATH. The examples below write `speakeasy`.
+The pasted steps save the client under your home directory and use its
+full path, such as `~/.cache/speakeasy/0.1.1/speakeasy`. Use that path in
+every later command, or `speakeasy` if it is on your PATH. The examples
+below write `speakeasy`.
 
 The invitation is a secret. Never put it on a command line (other users of
 the machine can see command lines), in a file that others can read, or in a
