@@ -45,6 +45,8 @@ const KEEP_BYTES: usize = 8 << 20;
 const BATCH: usize = 500;
 /// Longest message the page may submit, in bytes.
 const MAX_TEXT: usize = 64 * 1024;
+const OLD_DAEMON: &str = "this session was started by an older speakeasy; \
+                          read it with `speakeasy recv`, or start a new session";
 
 struct Page {
     handle: String,
@@ -62,7 +64,8 @@ struct Page {
 struct Log {
     /// The number of the oldest event still held.
     first: u64,
-    events: VecDeque<Value>,
+    /// Each with its size, as counted against `KEEP_BYTES`.
+    events: VecDeque<(usize, Value)>,
     bytes: usize,
     /// Who is in the room, as the daemon last reported it.
     members: Value,
@@ -75,16 +78,14 @@ impl Log {
         self.first + self.events.len() as u64
     }
 
-    fn weight(event: &Value) -> usize {
-        event["text"].as_str().map_or(0, str::len) + 200
-    }
-
     fn push(&mut self, event: Value) {
-        self.bytes += Self::weight(&event);
-        self.events.push_back(event);
+        // The whole event, since a member chooses its name as well as its text.
+        let size = event.to_string().len();
+        self.bytes += size;
+        self.events.push_back((size, event));
         while self.events.len() > KEEP || self.bytes > KEEP_BYTES {
-            let Some(old) = self.events.pop_front() else { break };
-            self.bytes -= Self::weight(&old);
+            let Some((size, _)) = self.events.pop_front() else { break };
+            self.bytes -= size;
             self.first += 1;
         }
     }
@@ -92,18 +93,26 @@ impl Log {
     /// Take one batch from the daemon. Its events are numbered, ending at
     /// `last`, so a batch handed over twice (because the acknowledgement
     /// went missing) adds nothing the second time.
-    fn take(&mut self, reply: &Value) {
-        self.members = reply["members"].clone();
+    fn take(&mut self, reply: &Value) -> Result<(), String> {
         let events = reply["events"].as_array().map(Vec::as_slice).unwrap_or_default();
-        let last = reply["last"].as_u64().unwrap_or(self.taken);
+        // The notice of dropped events is not one of the numbered ones.
+        let numbered = events.iter().any(|e| e["type"] != "overflow");
+        let last = match reply["last"].as_u64() {
+            Some(last) => last,
+            // A daemon from before batches were numbered. Refused before
+            // the acknowledgement, so its events are not thrown away.
+            None if numbered => return Err(OLD_DAEMON.into()),
+            None => self.taken,
+        };
+        self.members = reply["members"].clone();
         for (i, e) in events.iter().enumerate() {
             let number = last.saturating_sub((events.len() - 1 - i) as u64);
-            // The notice of dropped events is not one of the numbered ones.
             if number > self.taken || e["type"] == "overflow" {
                 self.push(e.clone());
             }
         }
         self.taken = last;
+        Ok(())
     }
 }
 
@@ -112,13 +121,24 @@ impl Page {
         self.log.send_modify(|log| log.push(event));
     }
 
-    /// One request to the session's daemon, off the async threads.
-    async fn daemon(&self, req: Request, wait: Duration) -> Value {
-        let handle = self.handle.clone();
-        tokio::task::spawn_blocking(move || call(&handle, &req, wait))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-            .unwrap_or_else(|e| json!({"error": e}))
+    /// One request to the session's daemon, off the async threads. Once
+    /// started it runs to the end, whether or not anyone waits for the answer.
+    async fn daemon(self: Arc<Self>, req: Request, wait: Duration) -> Value {
+        let work = tokio::task::spawn_blocking(move || {
+            let text = match &req {
+                Request::Send { text } => Some(text.clone()),
+                _ => None,
+            };
+            let reply = call(&self.handle, &req, wait).unwrap_or_else(|e| json!({"error": e}));
+            // The daemon does not echo a member's own messages, so the page's
+            // copy is recorded here, once the relay has placed it in the
+            // order, even if the browser has given up on the request.
+            if let Some(text) = text.filter(|_| reply["ok"] == true) {
+                self.push(json!({"type": "sent", "seq": reply["seq"], "text": text}));
+            }
+            reply
+        });
+        work.await.unwrap_or_else(|e| json!({"error": e.to_string()}))
     }
 }
 
@@ -126,8 +146,9 @@ impl Page {
 fn follow(page: &Page) {
     let reason = loop {
         let batch = recv_batch(&page.handle, HOLD.as_secs_f64(), |reply| {
-            page.log.send_modify(|log| log.take(reply));
-            Ok(())
+            let mut taken = Ok(());
+            page.log.send_modify(|log| taken = log.take(reply));
+            taken
         });
         match batch {
             Err(e) => break e,
@@ -237,28 +258,26 @@ async fn index(State(page): State<Arc<Page>>) -> Html<String> {
 
 #[derive(Deserialize)]
 struct After {
-    #[serde(default)]
-    after: u64,
-    /// Answer at once, even with nothing new: a page that has just loaded
-    /// needs to know who it is and who is in the room.
-    #[serde(default)]
-    now: bool,
+    /// Absent on a page's first request, which is answered at once so the
+    /// page learns who it is and who is in the room.
+    after: Option<u64>,
 }
 
 /// Events numbered `after` and up. Held open for a while if there are none.
 async fn events(State(page): State<Arc<Page>>, Query(q): Query<After>) -> Json<Value> {
     let mut log = page.log.subscribe();
-    if !q.now {
-        let _ = tokio::time::timeout(HOLD, log.wait_for(|log| log.next() > q.after)).await;
+    if let Some(after) = q.after {
+        let _ = tokio::time::timeout(HOLD, log.wait_for(|log| log.next() > after)).await;
     }
     let log = log.borrow();
     // `first` tells a page that fell behind how much it can no longer get.
-    let from = q.after.clamp(log.first, log.next());
+    let from = q.after.unwrap_or(0).clamp(log.first, log.next());
     let events: Vec<&Value> = log
         .events
         .iter()
         .skip((from - log.first) as usize)
         .take(BATCH)
+        .map(|(_, e)| e)
         .collect();
     Json(json!({
         "me": page.me,
@@ -270,18 +289,7 @@ async fn events(State(page): State<Arc<Page>>, Query(q): Query<After>) -> Json<V
 }
 
 async fn send(State(page): State<Arc<Page>>, text: String) -> Json<Value> {
-    // In a task of its own: if the browser gives up on this request, the
-    // message may still go out, and the page's record of it must be kept.
-    let sent = tokio::spawn(async move {
-        let reply = page.daemon(Request::Send { text: text.clone() }, SEND_WAIT).await;
-        // The daemon does not echo a member's own messages, so the page's
-        // copy is recorded here, once the relay has placed it in the order.
-        if reply["ok"] == true {
-            page.push(json!({"type": "sent", "seq": reply["seq"], "text": text}));
-        }
-        reply
-    });
-    Json(sent.await.unwrap_or_else(|e| json!({"error": e.to_string(), "delivered": "unknown"})))
+    Json(page.daemon(Request::Send { text }, SEND_WAIT).await)
 }
 
 async fn invite(State(page): State<Arc<Page>>) -> Json<Value> {

@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::crypto::{Blob, Invite, RoomKeys, b64, hex, random, sign, transcript, unb64};
-use crate::mls::{Keys, Mls};
+use crate::mls::{Keys, Mls, Peer};
 use crate::proto::{FromRelay, Kind, ToRelay};
 
 const INBOX_CAP: usize = 1000;
@@ -77,7 +77,7 @@ struct Inbox {
     key: Option<String>,
     /// Who is in the room, as `{name, key}`. Events are handed out once, so
     /// this is how a reader that starts late learns who is already there.
-    members: Vec<Value>,
+    members: Vec<Peer>,
     name: String,
 }
 
@@ -717,7 +717,7 @@ impl Session {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Joining { mls, commit_id, .. } if commit_id == id => {
                 // Exactly our commit was sequenced: the provisional group is real.
-                let members = roster(&mls);
+                let members = mls.members();
                 self.phase = Phase::Active { mls };
                 self.last_commit = seq;
                 self.shared.update(|i| {
@@ -744,7 +744,7 @@ impl Session {
                     Ok(p) => {
                         // Taken afresh, not appended to: a member that
                         // rejoins replaces its old self.
-                        let members = roster(&mls);
+                        let members = mls.members();
                         self.shared.update(|i| i.members = members);
                         self.shared.event(json!({
                             "type": "joined", "seq": seq, "name": p.name, "key": p.key,
@@ -957,8 +957,8 @@ async fn create(
         i.phase = "active";
         i.invite = Some(encoded);
         i.room = Some(room.to_string());
-        i.members = vec![json!({"name": name, "key": my_key})];
-        i.key = Some(my_key);
+        i.key = Some(my_key.clone());
+        i.members = vec![Peer { name: name.to_string(), key: my_key }];
     });
     Ok(session)
 }
@@ -1085,14 +1085,6 @@ pub fn socket_path(handle: &str) -> Result<PathBuf, String> {
 /// Hand a reader whatever is waiting. Events are removed only after the
 /// reader acknowledges them, so a reader that dies mid-read loses nothing
 /// (the next one may see those events again).
-/// Who is in the group, as readers are shown it.
-fn roster(mls: &Mls) -> Vec<Value> {
-    mls.members()
-        .into_iter()
-        .map(|p| json!({"name": p.name, "key": p.key}))
-        .collect()
-}
-
 async fn serve_recv(
     wait: f64,
     shared: &Shared,
@@ -1242,6 +1234,9 @@ pub async fn run(
     });
 
     // Report readiness as soon as the session is in the room or has failed.
+    // Only the creator is told the invitation here: it is new to them. A
+    // joiner supplied it, and it must not come back out on their terminal.
+    let creating = matches!(start, Start::Create { .. });
     let (watch_shared, handle_owned) = (shared.clone(), handle.to_string());
     tokio::spawn(async move {
         let outcome = watch_shared.wait_for(|i| {
@@ -1250,7 +1245,7 @@ pub async fn run(
             }
             (i.phase == "active").then(|| {
                 let mut out = json!({"session": handle_owned, "room": i.room, "name": i.name});
-                if let Some(invite) = &i.invite {
+                if let Some(invite) = i.invite.as_ref().filter(|_| creating) {
                     out["invite"] = json!(invite);
                 }
                 out

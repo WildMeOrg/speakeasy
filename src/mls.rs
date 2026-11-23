@@ -44,7 +44,7 @@ impl Keys {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Peer {
     pub name: String,
     pub key: String,

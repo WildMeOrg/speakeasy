@@ -114,29 +114,35 @@ dialog pre {
 <script nonce="__NONCE__">
 "use strict";
 const $ = (id) => document.getElementById(id);
-// The secret arrives after the `#`. It is moved out of the address bar, so it
-// is not left in the browser's history, and kept for this tab only, so a
-// reload still works.
-function takeToken() {
-  let t = location.hash.slice(1);
-  try {
-    if (t) sessionStorage.setItem("token", t);
-    else t = sessionStorage.getItem("token") || "";
-  } catch (err) { /* storage is off: the link works until the page reloads */ }
-  if (location.hash) history.replaceState(null, "", location.pathname);
-  return t;
-}
-const token = takeToken();
+// The secret arrives after the `#`. It is taken out of the address bar, so it
+// is not left in the browser's history, and held in memory only: after a
+// reload the page asks for the printed link again.
+const token = location.hash.slice(1);
+if (token) history.replaceState(null, "", location.pathname);
 let next = 0, over = false, me = null, members = [];
+// Set when a request fails. Nothing more is sent after that: once
+// `speakeasy ui` has stopped, something else on this machine could take over
+// its address, and must not be handed the secret or anything typed here.
+let cut = false;
+const LOST = "The page lost its connection to `speakeasy ui`. You may still be in the room. Run `speakeasy ui` again and open the link it prints.";
 
 async function api(method, path, body) {
-  const r = await fetch(path, {
-    method, body, cache: "no-store",
-    headers: { Authorization: "Bearer " + token },
-  });
-  if (r.status === 401 || r.status === 403) throw new Error("denied");
-  if (!r.ok) throw new Error("the page server answered " + r.status);
-  return r.json();
+  if (cut) throw new Error("no connection");
+  try {
+    const r = await fetch(path, {
+      method, body, cache: "no-store",
+      headers: { Authorization: "Bearer " + token },
+    });
+    if (!r.ok) throw new Error(r.status);
+    return await r.json();
+  } catch (err) {
+    cut = true;
+    for (const d of document.querySelectorAll("dialog[open]")) d.close();
+    finish(err.message === "401" || err.message === "403"
+      ? "This link no longer works. Run `speakeasy ui` again and open the link it prints."
+      : LOST);
+    throw err;
+  }
 }
 
 function el(tag, cls, text) {
@@ -206,8 +212,8 @@ function show(e) {
     case "sent": message(me.name + " (you)", "", e.text, true, e.seq); break;
     case "gap": note("You were disconnected for too long and missed some messages.", true); break;
     case "overflow": note("Some older events were dropped before this page read them.", true); break;
-    case "undecryptable": note("A message arrived that could not be read.", true); break;
-    case "join_rejected": note("Someone tried to join without a valid invitation and was refused."); break;
+    case "undecryptable": note("A message arrived that could not be read.", true, e.seq); break;
+    case "join_rejected": note("Someone tried to join without a valid invitation and was refused.", false, e.seq); break;
     case "closed": finish(reasons[e.reason] || "The room is over: " + e.reason); break;
     default: note("Event: " + e.type);
   }
@@ -224,10 +230,10 @@ function finish(text, again) {
 }
 
 async function follow() {
-  if (!token) return finish("This link is incomplete. Run `speakeasy ui` again and open the link it prints.");
+  if (!token) return finish("Open the link that `speakeasy ui` printed. It is needed again after a reload.");
   while (!over) {
     try {
-      const r = await api("GET", "/api/events?after=" + next + (me ? "" : "&now=true"));
+      const r = await api("GET", "/api/events" + (me ? "?after=" + next : ""));
       if (!me) {
         me = r.me;
         $("state").textContent = "You are " + me.name + " in room " + me.room;
@@ -238,26 +244,26 @@ async function follow() {
       r.events.forEach(show);
       next = r.next;
     } catch (err) {
-      // No retrying: once `speakeasy ui` has stopped, something else on this
-      // machine could take over its address, and must not be sent anything.
-      if (err.message === "denied") return finish("This link no longer works. Run `speakeasy ui` again and open the link it prints.");
-      return finish("The page lost its connection to `speakeasy ui`. You may still be in the room. Run `speakeasy ui` again and open the link it prints.");
+      return; // api() has already said why and stopped the page
     }
   }
 }
+
+const UNSURE = "That message may or may not have reached the room. Ask the others before sending it again.";
 
 $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const box = $("text"), text = box.value;
   if (!text.trim() || over) return;
+  if (new Blob([text]).size > 60000) return note("That message is too long to send in one piece.", true);
   $("send").disabled = box.disabled = true;
   try {
     const r = await api("POST", "/api/send", text);
     if (r.ok) box.value = "";
-    else if (r.delivered === "unknown") note("That message may or may not have reached the room. Ask before sending it again.", true);
-    else if (r.error !== "closed") note("Not sent: " + (r.error || "unknown error"), true);
+    else if (r.delivered === "no") { if (r.error !== "closed") note("Not sent: " + r.error, true); }
+    else note(UNSURE, true);
   } catch (err) {
-    note("That message may or may not have reached the room (" + err.message + "). Ask before sending it again.", true);
+    note(UNSURE, true);
   }
   if (!over) { $("send").disabled = box.disabled = false; box.focus(); }
 });
@@ -276,9 +282,7 @@ $("invite").addEventListener("click", async () => {
     $("invite-text").textContent = r.text;
     $("invite-copy").textContent = "Copy";
     $("invite-box").showModal();
-  } catch (err) {
-    note("No invitation: " + err.message, true);
-  }
+  } catch (err) { /* api() has already stopped the page */ }
 });
 $("invite-copy").addEventListener("click", async () => {
   try {
@@ -302,9 +306,7 @@ $("panic-go").addEventListener("click", async () => {
     if (r.error) note("Could not close the room: " + r.error, true);
     else if (r.relay_confirmed) finish("You closed the room. The relay confirmed it.", true);
     else finish("Closed on this machine, but the relay could not be reached to confirm it. The room may still be open for others.", true);
-  } catch (err) {
-    note("Could not close the room: " + err.message, true);
-  }
+  } catch (err) { /* api() has already stopped the page */ }
 });
 
 $("leave").addEventListener("click", async () => {
@@ -312,9 +314,7 @@ $("leave").addEventListener("click", async () => {
     const r = await api("POST", "/api/leave");
     if (r.error) note("Could not leave: " + r.error, true);
     else finish(reasons.left);
-  } catch (err) {
-    note("Could not leave: " + err.message, true);
-  }
+  } catch (err) { /* api() has already stopped the page */ }
 });
 
 // A new link opened in this tab differs only after the `#`, which a browser
