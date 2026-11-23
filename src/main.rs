@@ -166,6 +166,11 @@ fn run(cli: Cli) -> Result<u8, String> {
             let handle = resolve(cli.session)?;
             let mut reply = call(&handle, &Request::Status, Duration::from_secs(5))?;
             reply["session"] = json!(handle);
+            // A daemon started by an older client still puts the invitation
+            // in its status. It is not shown; `invite` is the way to get it.
+            if let Some(fields) = reply.as_object_mut() {
+                fields.remove("invite");
+            }
             println!("{reply}");
             Ok(if reply["closed"].is_null() { 0 } else { CLOSED })
         }
@@ -205,6 +210,12 @@ fn run(cli: Cli) -> Result<u8, String> {
 fn invite_text(handle: &str) -> Result<Result<String, Value>, String> {
     let reply = call(handle, &Request::Invite, Duration::from_secs(5))?;
     let Some(invite) = reply["invite"].as_str() else {
+        if reply["error"].is_string() {
+            // A daemon started by an older client does not know the request.
+            return Err("this session was started by an older speakeasy and cannot \
+                        produce the invite text; use the invitation you were given"
+                .into());
+        }
         if reply["closed"].is_null() {
             return Err("not in the room yet".into());
         }

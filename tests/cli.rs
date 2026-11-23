@@ -119,7 +119,10 @@ impl Agent {
         // The secret went in on stdin and must not come back out.
         assert!(!format!("{:?}", out.lines).contains(invite), "join printed the invitation");
         // Nor is it in what `status` shows.
-        assert!(!format!("{:?}", a.run(&["status"]).lines).contains("spk1."), "status printed the invitation");
+        let status = a.run(&["status"]);
+        assert_eq!(status.lines.len(), 1);
+        assert!(status.lines[0].get("invite").is_none(), "status has an invite field");
+        assert!(!status.lines[0].to_string().contains(invite), "status printed the invitation");
         a
     }
 
